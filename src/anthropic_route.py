@@ -19,8 +19,11 @@ from .router import (
     PROMPTS_DIR,
     ClientRequestError,
     VisionUnavailable,
+    _cache_desc,
     _ensure_reasoning_content,
     _extract_current_images,
+    _find_cached_history_image,
+    _inject_history_description,
     _normalize_tool_pairing,
     _parse_content,
     _pick_focus_text,
@@ -98,6 +101,10 @@ async def route_messages(body: dict):
             s = _strip_message_images(message)
             if s is not None:
                 stripped.append(s)
+        cached = _find_cached_history_image(messages)
+        if cached is not None:
+            stripped = _inject_history_description(stripped, cached)
+            logger.info("anthropic history image description injected (len=%d)", len(cached))
         stripped = _ensure_reasoning_content(stripped)
         fwd_messages = _prepend_system(stripped, system_text)
         return await _forward_anthropic(fwd_messages, params, model, stream)
@@ -125,6 +132,7 @@ async def route_messages(body: dict):
         focus = results[1]
 
     merged = merger.merge_image_info(overall, focus, cur_text)
+    _cache_desc(image_utils.image_hash(cur_images[0]), merged)
 
     # Cache-friendly assembly: keep the SHARED prefix (system_text + history)
     # identical across image and no-image turns, and put LLM_SYSTEM + merged

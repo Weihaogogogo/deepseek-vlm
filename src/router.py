@@ -1,7 +1,9 @@
 """Routing: no-image passthrough to deepseek; image requests go through dual VLM + merge."""
 import asyncio
 import logging
+from collections import OrderedDict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -72,6 +74,53 @@ def _parse_content(content) -> tuple[str, list[str]]:
 
 
 FOCUS_BUDGET_CHARS = 1000
+
+# VLM 描述缓存：图片 hash -> 合并描述文本（LLM_SYSTEM 之外的 merged）。
+# 有图轮存，无图轮查（历史图片跨轮保留视觉信息，agent 工具读图场景必需）。
+_DESC_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_DESC_CACHE_MAX = 200
+
+
+def _cache_desc(key: str, merged: str) -> None:
+    _DESC_CACHE[key] = merged
+    _DESC_CACHE.move_to_end(key)
+    while len(_DESC_CACHE) > _DESC_CACHE_MAX:
+        _DESC_CACHE.popitem(last=False)
+
+
+def _find_cached_history_image(messages: list) -> str | None:
+    """Merged description of the MOST RECENT history image (not current turn),
+    if its VLM output was cached. Returns None when no cached history image."""
+    for m in reversed(messages):
+        if m.get("role") not in ("user", "tool"):
+            continue
+        content = m.get("content")
+        if content is None:
+            continue
+        _, imgs = _parse_content(content)
+        if not imgs:
+            continue
+        for url in reversed(imgs):
+            key = image_utils.image_hash(url)
+            if key in _DESC_CACHE:
+                return _DESC_CACHE[key]
+        return None  # has images but none cached; stop at the newest one
+    return None
+
+
+def _inject_history_description(stripped: list, merged: str) -> list:
+    """Insert LLM_SYSTEM + cached description right BEFORE the last user
+    message, mirroring the image-turn layout so the shared prefix stays
+    identical (deepseek prefix cache) and the model gets vision context."""
+    out = list(stripped)
+    insert_pos = len(out)
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user":
+            insert_pos = i
+            break
+    out.insert(insert_pos, {"role": "user", "content": LLM_SYSTEM})
+    out.insert(insert_pos + 1, {"role": "user", "content": merged})
+    return out
 
 
 def _pick_focus_text(messages: list) -> str:
@@ -317,6 +366,10 @@ async def route_chat_completions(body: dict):
             s = _strip_message_images(message)
             if s is not None:
                 stripped.append(s)
+        cached = _find_cached_history_image(messages)
+        if cached is not None:
+            stripped = _inject_history_description(stripped, cached)
+            logger.info("history image description injected (len=%d)", len(cached))
         stripped = _ensure_reasoning_content(stripped)
         return await _forward(stripped, body, model, stream)
 
@@ -351,6 +404,7 @@ async def route_chat_completions(body: dict):
         focus = results[1]
 
     merged = merger.merge_image_info(overall, focus, cur_text)
+    _cache_desc(image_utils.image_hash(cur_images[0]), merged)
 
     # Cache-friendly assembly: keep the shared prefix (system messages +
     # history) identical across image and no-image turns; LLM_SYSTEM goes at

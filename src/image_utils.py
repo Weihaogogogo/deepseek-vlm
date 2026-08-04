@@ -1,6 +1,7 @@
 """Image parsing (URL / base64 data URL), download, compression, base64 re-encode."""
 import asyncio
 import base64
+import hashlib
 import io
 import logging
 
@@ -81,3 +82,22 @@ async def prepare_image(url: str) -> str:
     else:
         raise ImageParseError("unsupported image url scheme (expected http(s) or data URL)")
     return await asyncio.to_thread(_process_image, raw)
+
+
+def image_hash(url: str) -> str:
+    """Content hash of an image URL (used as the VLM description cache key).
+
+    Hashes the RAW image bytes so the same picture sent as URL or base64 maps
+    to the same key. Cheap for data URLs (hash on raw bytes, before any
+    download/compression).
+    """
+    if url.startswith("data:"):
+        try:
+            raw = _parse_data_url(url)
+        except ImageParseError:
+            return f"url:{url[:120]}"
+    elif url.startswith(("http://", "https://")):
+        return f"url:{url}"
+    else:
+        return f"raw:{url[:120]}"
+    return hashlib.sha256(raw).hexdigest()
