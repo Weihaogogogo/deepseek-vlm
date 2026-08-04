@@ -125,18 +125,25 @@ async def route_messages(body: dict):
 
     merged = merger.merge_image_info(overall, focus, cur_text)
 
-    new_messages: list[dict] = [{"role": "system", "content": LLM_SYSTEM}]
+    # Cache-friendly assembly: keep the SHARED prefix (system_text + history)
+    # identical across image and no-image turns, and put LLM_SYSTEM + merged
+    # description at the END as user messages. deepseek's prefix cache then
+    # hits on all history tokens on every turn (verified: any change at the
+    # start of the request invalidates the whole cache).
+    new_messages: list[dict] = []
     if system_text.strip():
         new_messages.append({"role": "system", "content": system_text})
     for i, message in enumerate(messages):
+        if message.get("role") == "system":
+            continue  # explicit systems appended at the end (never in the shared prefix)
         if i == last_user_idx:
+            new_messages.append({"role": "user", "content": LLM_SYSTEM})
             new_messages.append({"role": "user", "content": merged})
             continue
-        if message.get("role") == "system":
-            continue  # already handled above (merged into the system list)
         stripped = _strip_message_images(message)
         if stripped:
             new_messages.append(stripped)
+    new_messages.extend(m for m in messages if m.get("role") == "system")
 
     new_messages = _ensure_reasoning_content(new_messages)
     return await _forward_anthropic(new_messages, params, model, stream)

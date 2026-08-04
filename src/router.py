@@ -319,19 +319,21 @@ async def route_chat_completions(body: dict):
 
     merged = merger.merge_image_info(overall, focus, cur_text)
 
-    new_messages: list[dict] = [{"role": "system", "content": LLM_SYSTEM}]
+    # Cache-friendly assembly: keep the shared prefix (system messages +
+    # history) identical across image and no-image turns; LLM_SYSTEM goes at
+    # the END as a user message so deepseek's prefix cache hits on history.
+    new_messages: list[dict] = []
     for i, message in enumerate(messages):
         if i == last_user_idx:
+            new_messages.append({"role": "user", "content": LLM_SYSTEM})
             new_messages.append({"role": "user", "content": merged})
             continue
         if message.get("role") == "system":
-            stripped = _strip_message_images(message)
-            if stripped:
-                new_messages.append(stripped)
-        else:
-            stripped = _strip_message_images(message)
-            if stripped:
-                new_messages.append(stripped)
+            new_messages.append(message)
+            continue
+        stripped = _strip_message_images(message)
+        if stripped:
+            new_messages.append(stripped)
 
     new_messages = _ensure_reasoning_content(new_messages)
     return await _forward(new_messages, body, model, stream)
