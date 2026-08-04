@@ -118,6 +118,25 @@ async def anthropic_messages(request: Request):
     try:
         return await route_anthropic_messages(body)
     except ClientRequestError as exc:
+        logger.exception("anthropic 400 (stack): %s", exc.message)
+        try:
+            block_types = [
+                [b.get("type") if isinstance(b, dict) else type(b).__name__ for b in m["content"]]
+                if isinstance(m.get("content"), list)
+                else None
+                for m in (body.get("messages") or [])
+            ]
+            summary = [
+                {
+                    "role": m.get("role"),
+                    "ctype": type(m.get("content")).__name__,
+                    "blocks": block_types[i],
+                }
+                for i, m in enumerate(body.get("messages") or [])
+            ]
+            logger.warning("anthropic 400 %s; body summary: %s", exc.message, summary)
+        except Exception:  # noqa: BLE001
+            pass
         return JSONResponse(
             status_code=400,
             content={

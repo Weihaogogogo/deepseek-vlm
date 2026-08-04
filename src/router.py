@@ -90,7 +90,10 @@ def _pick_focus_text(messages: list) -> str:
     for m in reversed(messages):
         if m.get("role") not in ("user", "assistant"):
             continue
-        t, _ = _parse_content(m.get("content"))
+        content = m.get("content")
+        if content is None:
+            continue  # assistant tool_calls messages have no content
+        t, _ = _parse_content(content)
         t = t.strip()
         if not t:
             continue
@@ -117,7 +120,10 @@ def _extract_current_images(messages: list) -> list[str]:
     """
     for m in reversed(messages):
         if m.get("role") == "user":
-            _, imgs = _parse_content(m.get("content"))
+            content = m.get("content")
+            if content is None:
+                break
+            _, imgs = _parse_content(content)
             if imgs:
                 return imgs[-1:]
             break
@@ -178,15 +184,21 @@ def _strip_message_images(message: dict):
 
 
 def _validate_messages(messages: list) -> None:
-    for message in messages:
+    for i, message in enumerate(messages):
         if not isinstance(message, dict) or not isinstance(message.get("role"), str):
-            raise ClientRequestError("each message must be an object with a role")
+            raise ClientRequestError(f"each message must be an object with a role (index {i})")
         if message["role"] not in VALID_ROLES:
-            raise ClientRequestError(f"unsupported role: {message['role']}")
+            raise ClientRequestError(f"unsupported role: {message['role']} (index {i})")
         if message.get("content") is None and "tool_calls" not in message:
-            raise ClientRequestError("message missing content")
+            raise ClientRequestError(f"message missing content (index {i})")
         if message.get("content") is not None:
-            _parse_content(message["content"])
+            try:
+                _parse_content(message["content"])
+            except ClientRequestError as exc:
+                raise ClientRequestError(
+                    f"invalid message content at index {i} role={message['role']} "
+                    f"ctype={type(message['content']).__name__}: {exc}"
+                ) from exc
 
 
 async def _forward(messages: list, body: dict, model: str, stream: bool):
