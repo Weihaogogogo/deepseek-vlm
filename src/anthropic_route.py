@@ -149,12 +149,45 @@ async def _forward_anthropic(messages: list, params: dict, model: str, stream: b
         try:
             chunk_iter = _llm.stream_chunks(messages, body_params)
         except LLMBackendError as exc:
+            _log_message_pairs(messages, exc)
             return _llm_error_response(exc)
+
+        async def _stream_with_error_log():
+            try:
+                async for line in anthropic_sse(chunk_iter, model):
+                    yield line
+            except LLMBackendError as exc:
+                _log_message_pairs(messages, exc)
+                raise
+
         return StreamingResponse(
-            anthropic_sse(chunk_iter, model), media_type="text/event-stream"
+            _stream_with_error_log(), media_type="text/event-stream"
         )
     try:
         data = await _llm.complete(messages, body_params)
     except LLMBackendError as exc:
+        _log_message_pairs(messages, exc)
         return _llm_error_response(exc)
     return JSONResponse(content=to_anthropic_message(data, model))
+
+
+def _log_message_pairs(messages: list, exc: Exception) -> None:
+    """Log tool_calls/tool pairing structure on deepseek errors."""
+    try:
+        summary = []
+        for i, m in enumerate(messages):
+            entry = {
+                "i": i,
+                "role": m.get("role"),
+                "content": (
+                    None if m.get("content") is None else type(m.get("content")).__name__
+                ),
+            }
+            if m.get("tool_calls"):
+                entry["tool_calls"] = [tc.get("id") for tc in m["tool_calls"]]
+            if m.get("tool_call_id"):
+                entry["tool_call_id"] = m["tool_call_id"]
+            summary.append(entry)
+        logger.warning("deepseek error %s; message pairs: %s", exc, summary)
+    except Exception:  # noqa: BLE001
+        pass

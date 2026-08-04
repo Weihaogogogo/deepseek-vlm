@@ -171,6 +171,11 @@ def _strip_message_images(message: dict):
             if not (isinstance(part, dict) and part.get("type") == "image_url")
         ]
         if not kept:
+            if message.get("role") == "tool":
+                # Tool messages MUST survive even empty: they pair with the
+                # preceding assistant tool_calls. deepseek rejects orphan
+                # tool_calls (assistant tool_calls without matching tool msg).
+                return {**message, "content": ""}
             logger.warning(
                 "dropping history message (role=%s) whose content was only an image",
                 message.get("role"),
