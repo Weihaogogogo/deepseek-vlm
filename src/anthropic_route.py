@@ -37,6 +37,31 @@ _vlm = VLMClient(config.DASHSCOPE_API_KEY)
 _MODEL_NAME = config.DEEPSEEK_MODEL
 
 
+def _pick_focus_text(messages: list) -> str:
+    """Best user text for VLM-2 focus.
+
+    Uses the last substantive user message. If it is very short (likely a
+    referential follow-up like "还有呢？" whose semantics live earlier),
+    prepend the previous user message (truncated) as context. Tool messages
+    never contribute (tool_result blocks are role=tool after parsing).
+    """
+    candidates: list[str] = []
+    for m in messages:
+        if m.get("role") == "user":
+            t, _ = _parse_content(m.get("content"))
+            if t and t.strip():
+                candidates.append(t.strip())
+    if not candidates:
+        return ""
+    focus = candidates[-1]
+    if len(focus) <= 4 and len(candidates) >= 2:
+        prev = candidates[-2]
+        if len(prev) > 150:
+            prev = prev[:150] + "…"
+        focus = f"{prev} → {focus}"
+    return focus
+
+
 def _find_last_user_idx(messages: list) -> int:
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "user" and messages[i].get("content") is not None:
@@ -78,19 +103,16 @@ async def route_messages(body: dict):
     last_user_idx = _find_last_user_idx(messages)
     # Scan ALL messages (user + tool) for images: agent tools (Claude Code's
     # Read) return images inside tool_result blocks, not in the current user turn.
-    last_user_text = ""
     all_images: list[str] = []
     for m in messages:
         if m.get("role") == "user":
-            t, imgs = _parse_content(m.get("content"))
-            if t:
-                last_user_text = t
+            _, imgs = _parse_content(m.get("content"))
             all_images.extend(imgs)
         elif m.get("role") == "tool" and isinstance(m.get("content"), list):
             _, imgs = _parse_content(m.get("content"))
             all_images.extend(imgs)
     cur_images = all_images[-1:] if all_images else []  # keep the latest image
-    cur_text = last_user_text
+    cur_text = _pick_focus_text(messages)
     logger.info(
         "anthropic route: msg_count=%d cur_text_len=%d cur_images=%d",
         len(messages),
