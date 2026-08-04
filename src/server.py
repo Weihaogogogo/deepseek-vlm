@@ -77,7 +77,7 @@ async def list_models(request: Request):
     return JSONResponse(
         content={
             "object": "list",
-            "data": [{"id": "fake-vlm", "object": "model", "owned_by": "fake-vlm"}],
+            "data": [{"id": config.DEEPSEEK_MODEL, "object": "model", "owned_by": config.DEEPSEEK_MODEL}],
         }
     )
 

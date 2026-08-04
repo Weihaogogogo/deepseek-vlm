@@ -176,7 +176,14 @@ async def route_chat_completions(body: dict):
 
     if not cur_images:
         # No image in the current turn: forward untouched, no system injection.
-        return await _forward(messages, body, model, stream)
+        # BUT strip images from history messages — deepseek's compatibility
+        # layer rejects image_url content anywhere in the payload.
+        stripped = []
+        for message in messages:
+            s = _strip_message_images(message)
+            if s is not None:
+                stripped.append(s)
+        return await _forward(stripped, body, model, stream)
 
     try:
         data_url = await image_utils.prepare_image(cur_images[0])

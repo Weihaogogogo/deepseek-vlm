@@ -34,7 +34,7 @@ VLM2_SYSTEM = (PROMPTS_DIR / "vlm2_system.md").read_text(encoding="utf-8")
 _llm = DeepSeekClient()
 _vlm = VLMClient(config.DASHSCOPE_API_KEY)
 
-_MODEL_NAME = "fake-vlm"
+_MODEL_NAME = config.DEEPSEEK_MODEL
 
 
 def _find_last_user_idx(messages: list) -> int:
@@ -76,7 +76,21 @@ async def route_messages(body: dict):
     model = body.get("model") or _MODEL_NAME
 
     last_user_idx = _find_last_user_idx(messages)
-    cur_text, cur_images = _parse_content(messages[last_user_idx].get("content"))
+    # Scan ALL messages (user + tool) for images: agent tools (Claude Code's
+    # Read) return images inside tool_result blocks, not in the current user turn.
+    last_user_text = ""
+    all_images: list[str] = []
+    for m in messages:
+        if m.get("role") == "user":
+            t, imgs = _parse_content(m.get("content"))
+            if t:
+                last_user_text = t
+            all_images.extend(imgs)
+        elif m.get("role") == "tool" and isinstance(m.get("content"), list):
+            _, imgs = _parse_content(m.get("content"))
+            all_images.extend(imgs)
+    cur_images = all_images[-1:] if all_images else []  # keep the latest image
+    cur_text = last_user_text
     logger.info(
         "anthropic route: msg_count=%d cur_text_len=%d cur_images=%d",
         len(messages),
@@ -88,7 +102,12 @@ async def route_messages(body: dict):
         cur_images = cur_images[:1]
 
     if not cur_images:
-        fwd_messages = _prepend_system(messages, system_text)
+        stripped = []
+        for message in messages:
+            s = _strip_message_images(message)
+            if s is not None:
+                stripped.append(s)
+        fwd_messages = _prepend_system(stripped, system_text)
         return await _forward_anthropic(fwd_messages, params, model, stream)
 
     try:

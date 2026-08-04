@@ -106,12 +106,28 @@ def parse_messages(anthropic_msgs: list) -> list[dict]:
                     tid = res.get("tool_use_id", "")
                     rcontent = res.get("content", "")
                     if isinstance(rcontent, list):
-                        rcontent = "\n".join(
-                            b.get("text", "") for b in rcontent if isinstance(b, dict) and b.get("type") == "text"
-                        )
-                    out.append(
-                        {"role": "tool", "tool_call_id": tid, "content": str(rcontent)}
-                    )
+                        # Keep image blocks as image_url so the route layer can
+                        # extract them for the vision pipeline (agent tools like
+                        # Claude Code's Read return images inside tool_result).
+                        parts: list[dict] = []
+                        for b in rcontent:
+                            if not isinstance(b, dict):
+                                continue
+                            bt = b.get("type")
+                            if bt == "text":
+                                parts.append({"type": "text", "text": b.get("text", "")})
+                            elif bt == "image":
+                                src = b.get("source") or {}
+                                if src.get("type") == "base64":
+                                    media = src.get("media_type", "image/jpeg")
+                                    parts.append(
+                                        {"type": "image_url", "image_url": {"url": f"data:{media};base64,{src.get('data','')}"}}
+                                    )
+                                elif src.get("type") == "url":
+                                    parts.append({"type": "image_url", "image_url": {"url": src.get("url", "")}})
+                        out.append({"role": "tool", "tool_call_id": tid, "content": parts if parts else ""})
+                    else:
+                        out.append({"role": "tool", "tool_call_id": tid, "content": str(rcontent)})
                 continue
             out.append({"role": "user", "content": _content_to_openai(content) if isinstance(content, list) else content})
         elif role == "assistant":
@@ -263,6 +279,7 @@ async def anthropic_sse(chunk_iter, model: str):
     tool_indices: dict[int, bool] = {}
     usage = {"input_tokens": 0, "output_tokens": 0}
     stop_reason = None
+    blocks_done = False
 
     def evt(name: str, data: dict) -> str:
         return f"event: {name}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
@@ -299,6 +316,19 @@ async def anthropic_sse(chunk_iter, model: str):
 
         if choice.finish_reason:
             stop_reason = _stop_reason(choice.finish_reason)
+            # Anthropic requires a content_block_stop after each block's deltas.
+            if not blocks_done:
+                if text_index is not None:
+                    yield evt(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": text_index},
+                    )
+                for idx in sorted(tool_indices):
+                    yield evt(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": idx},
+                    )
+                blocks_done = True
 
         if delta:
             if delta.content:
@@ -367,6 +397,18 @@ async def anthropic_sse(chunk_iter, model: str):
                 },
             },
         )
+    elif not blocks_done:
+        # Stream ended without an explicit finish_reason: close open blocks.
+        if text_index is not None:
+            yield evt(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": text_index},
+            )
+        for idx in sorted(tool_indices):
+            yield evt(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": idx},
+            )
     yield evt(
         "message_delta",
         {
