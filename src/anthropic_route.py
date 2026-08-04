@@ -19,6 +19,7 @@ from .router import (
     PROMPTS_DIR,
     ClientRequestError,
     VisionUnavailable,
+    _DESC_CACHE,
     _cache_desc,
     _ensure_reasoning_content,
     _extract_current_images,
@@ -91,17 +92,13 @@ async def route_messages(body: dict):
         len(cur_text),
         len(cur_images),
     )
-    if len(cur_images) > 1:
-        logger.warning("anthropic: %d images, keeping the first", len(cur_images))
-        cur_images = cur_images[:1]
-
     if not cur_images:
         stripped = []
         for message in messages:
             s = _strip_message_images(message)
             if s is not None:
                 stripped.append(s)
-        cached = _find_cached_history_image(messages)
+        cached = _find_cached_history_image(messages, cur_text)
         if cached is not None:
             stripped = _inject_history_description(stripped, cached)
             logger.info("anthropic history image description injected (len=%d)", len(cached))
@@ -110,29 +107,54 @@ async def route_messages(body: dict):
         return await _forward_anthropic(fwd_messages, params, model, stream)
 
     try:
-        data_url = await image_utils.prepare_image(cur_images[0])
+        data_urls = await asyncio.gather(
+            *[image_utils.prepare_image(url) for url in cur_images]
+        )
     except ImageParseError as exc:
         raise ClientRequestError(f"invalid image: {exc}", code="invalid_image") from exc
 
     run_vlm2 = len(cur_text.strip()) > 1
-    tasks = [_vlm.describe_overall(VLM1_SYSTEM, data_url)]
-    if run_vlm2:
-        tasks.append(_vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text))
-    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    if isinstance(results[0], Exception):
-        logger.error("anthropic VLM-1 failed: %s", results[0])
-        raise VisionUnavailable from results[0]
-    overall = results[0]
-    focus = None
-    if run_vlm2:
-        if isinstance(results[1], Exception):
-            logger.error("anthropic VLM-2 failed: %s", results[1])
-            raise VisionUnavailable from results[1]
-        focus = results[1]
+    per_image: list[dict | None] = []
+    pending: list[tuple[str, str]] = []
+    for url, data_url in zip(cur_images, data_urls):
+        key = image_utils.image_hash(url)
+        cached = _DESC_CACHE.get(key)
+        if cached is not None:
+            per_image.append(cached)
+        else:
+            per_image.append(None)
+            pending.append((data_url, key))
 
-    merged = merger.merge_image_info(overall, focus, cur_text)
-    _cache_desc(image_utils.image_hash(cur_images[0]), merged)
+    async def vlm_pair(data_url: str) -> tuple[str, str | None]:
+        if run_vlm2:
+            overall, focus = await asyncio.gather(
+                _vlm.describe_overall(VLM1_SYSTEM, data_url),
+                _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text),
+            )
+            return overall, focus
+        overall = await _vlm.describe_overall(VLM1_SYSTEM, data_url)
+        return overall, None
+
+    if pending:
+        pair_results = await asyncio.gather(
+            *[vlm_pair(d) for d, _ in pending], return_exceptions=True
+        )
+        pi = 0
+        for i, item in enumerate(per_image):
+            if item is not None:
+                continue
+            res = pair_results[pi]
+            pi += 1
+            if isinstance(res, Exception):
+                logger.error("anthropic VLM failed: %s", res)
+                raise VisionUnavailable from res
+            overall, focus = res
+            cached = {"overall": overall, "focus": focus}
+            per_image[i] = cached
+            _cache_desc(pending[pi - 1][1], overall, focus)
+
+    merged = merger.merge_multi_image(per_image, cur_text)
 
     # Cache-friendly assembly: keep the SHARED prefix (system_text + history)
     # identical across image and no-image turns, and put LLM_SYSTEM + merged

@@ -75,22 +75,23 @@ def _parse_content(content) -> tuple[str, list[str]]:
 
 FOCUS_BUDGET_CHARS = 1000
 
-# VLM 描述缓存：图片 hash -> 合并描述文本（LLM_SYSTEM 之外的 merged）。
+# VLM 描述缓存：图片 hash -> {"overall": VLM-1输出, "focus": VLM-2输出}。
 # 有图轮存，无图轮查（历史图片跨轮保留视觉信息，agent 工具读图场景必需）。
-_DESC_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_DESC_CACHE: "OrderedDict[str, dict]" = OrderedDict()
 _DESC_CACHE_MAX = 200
+_MAX_IMAGES_PER_TURN = 10
 
 
-def _cache_desc(key: str, merged: str) -> None:
-    _DESC_CACHE[key] = merged
+def _cache_desc(key: str, overall: str, focus: str | None) -> None:
+    _DESC_CACHE[key] = {"overall": overall, "focus": focus}
     _DESC_CACHE.move_to_end(key)
     while len(_DESC_CACHE) > _DESC_CACHE_MAX:
         _DESC_CACHE.popitem(last=False)
 
 
-def _find_cached_history_image(messages: list) -> str | None:
-    """Merged description of the MOST RECENT history image (not current turn),
-    if its VLM output was cached. Returns None when no cached history image."""
+def _find_cached_history_image(messages: list, question: str) -> str | None:
+    """Merged description (overall + focus + current question) of the MOST
+    RECENT history image, if its VLM output was cached."""
     for m in reversed(messages):
         if m.get("role") not in ("user", "tool"):
             continue
@@ -103,7 +104,10 @@ def _find_cached_history_image(messages: list) -> str | None:
         for url in reversed(imgs):
             key = image_utils.image_hash(url)
             if key in _DESC_CACHE:
-                return _DESC_CACHE[key]
+                cached = _DESC_CACHE[key]
+                return merger.merge_image_info(
+                    cached.get("overall", ""), cached.get("focus"), question
+                )
         return None  # has images but none cached; stop at the newest one
     return None
 
@@ -158,30 +162,38 @@ def _pick_focus_text(messages: list) -> str:
 
 
 def _extract_current_images(messages: list) -> list[str]:
-    """Images belonging to the CURRENT turn only.
+    """Images belonging to the CURRENT turn only, newest-first, max 4.
 
-    - Images in the last user message (user just attached them), else
-    - Images in the last message IF that message is a tool result (agent just
-      Read a file this turn).
-    History images (earlier turns) are intentionally ignored: they were
-    already processed when first sent; re-processing them on every later
-    text-only turn is what made follow-ups slow.
+    - Collects images from user messages scanning backwards; skips user
+      messages without images (clients like WorkBuddy split image messages
+      and the text message into separate user messages).
+    - Stops at the first non-user message (assistant/system/tool) — that is
+      the "current turn" boundary: everything after the last assistant reply
+      belongs to this request, everything before it is history.
+    - Falls back to the last message IF it is a tool result (agent just Read
+      a file this turn).
+    History images (earlier turns) are intentionally ignored.
     """
+    collected: list[str] = []
     for m in reversed(messages):
-        if m.get("role") == "user":
-            content = m.get("content")
-            if content is None:
-                continue  # skip content-less user messages, keep scanning
-            _, imgs = _parse_content(content)
-            if imgs:
-                return imgs[-1:]
-            continue  # no image in this user message, keep scanning backwards
+        if m.get("role") != "user":
+            break
+        content = m.get("content")
+        if content is None:
+            continue
+        _, imgs = _parse_content(content)
+        if imgs:
+            collected.extend(reversed(imgs))
+            if len(collected) >= _MAX_IMAGES_PER_TURN:
+                break
+    if collected:
+        return collected[:_MAX_IMAGES_PER_TURN]
     if messages and messages[-1].get("role") == "tool" and isinstance(
         messages[-1].get("content"), list
     ):
         _, imgs = _parse_content(messages[-1].get("content"))
         if imgs:
-            return imgs[-1:]
+            return imgs[-_MAX_IMAGES_PER_TURN:]
     return []
 
 
@@ -269,7 +281,10 @@ def _strip_message_images(message: dict):
                 # the backend sees content, not an empty tool message.
                 for key in img_keys:
                     if key in _DESC_CACHE:
-                        return {**message, "content": _DESC_CACHE[key]}
+                        return {
+                            **message,
+                            "content": _DESC_CACHE[key].get("overall", ""),
+                        }
                 return {**message, "content": ""}
             logger.warning(
                 "dropping history message (role=%s) whose content was only an image",
@@ -399,20 +414,13 @@ async def route_chat_completions(body: dict):
             logger.info("no image detected; message structure=%s", structure)
         except Exception as exc:  # noqa: BLE001
             logger.warning("structure log failed: %s", exc)
-    if len(cur_images) > 1:
-        logger.warning(
-            "current turn has %d images; keeping the first, discarding the rest",
-            len(cur_images),
-        )
-        cur_images = cur_images[:1]
-
     if not cur_images:
         stripped = []
         for message in messages:
             s = _strip_message_images(message)
             if s is not None:
                 stripped.append(s)
-        cached = _find_cached_history_image(messages)
+        cached = _find_cached_history_image(messages, cur_text)
         if cached is not None:
             stripped = _inject_history_description(stripped, cached)
             logger.info("history image description injected (len=%d)", len(cached))
@@ -420,37 +428,55 @@ async def route_chat_completions(body: dict):
         return await _forward(stripped, body, model, stream)
 
     try:
-        data_url = await image_utils.prepare_image(cur_images[0])
+        data_urls = await asyncio.gather(
+            *[image_utils.prepare_image(url) for url in cur_images]
+        )
     except ImageParseError as exc:
         raise ClientRequestError(f"invalid image url: {exc}", code="invalid_image_url") from exc
 
     run_vlm2 = len(cur_text.strip()) > 1
 
-    async def vlm1_task():
-        return await _vlm.describe_overall(VLM1_SYSTEM, data_url)
+    # Per-image results; cache hits skip the VLM entirely.
+    per_image: list[dict | None] = []
+    pending: list[tuple[str, str]] = []  # (data_url, cache_key)
+    for url, data_url in zip(cur_images, data_urls):
+        key = image_utils.image_hash(url)
+        cached = _DESC_CACHE.get(key)
+        if cached is not None:
+            per_image.append(cached)
+        else:
+            per_image.append(None)
+            pending.append((data_url, key))
 
-    async def vlm2_task():
-        return await _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text)
+    async def vlm_pair(data_url: str) -> tuple[str, str | None]:
+        if run_vlm2:
+            overall, focus = await asyncio.gather(
+                _vlm.describe_overall(VLM1_SYSTEM, data_url),
+                _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text),
+            )
+            return overall, focus
+        overall = await _vlm.describe_overall(VLM1_SYSTEM, data_url)
+        return overall, None
 
-    tasks = [vlm1_task()]
-    if run_vlm2:
-        tasks.append(vlm2_task())
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    if pending:
+        pair_results = await asyncio.gather(
+            *[vlm_pair(d) for d, _ in pending], return_exceptions=True
+        )
+        pi = 0
+        for i, item in enumerate(per_image):
+            if item is not None:
+                continue
+            res = pair_results[pi]
+            pi += 1
+            if isinstance(res, Exception):
+                logger.error("VLM failed: %s", res)
+                raise VisionUnavailable from res
+            overall, focus = res
+            cached = {"overall": overall, "focus": focus}
+            per_image[i] = cached
+            _cache_desc(pending[pi - 1][1], overall, focus)
 
-    if isinstance(results[0], Exception):
-        logger.error("VLM-1 failed: %s", results[0])
-        raise VisionUnavailable from results[0]
-    overall = results[0]
-
-    focus = None
-    if run_vlm2:
-        if isinstance(results[1], Exception):
-            logger.error("VLM-2 failed: %s", results[1])
-            raise VisionUnavailable from results[1]
-        focus = results[1]
-
-    merged = merger.merge_image_info(overall, focus, cur_text)
-    _cache_desc(image_utils.image_hash(cur_images[0]), merged)
+    merged = merger.merge_multi_image(per_image, cur_text)
 
     # Cache-friendly assembly: keep the shared prefix (system messages +
     # history) identical across image and no-image turns; LLM_SYSTEM goes at
