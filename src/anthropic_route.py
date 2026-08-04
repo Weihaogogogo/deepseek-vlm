@@ -20,6 +20,7 @@ from .router import (
     ClientRequestError,
     VisionUnavailable,
     _ensure_reasoning_content,
+    _extract_current_images,
     _parse_content,
     _pick_focus_text,
     _strip_message_images,
@@ -78,17 +79,7 @@ async def route_messages(body: dict):
     model = body.get("model") or _MODEL_NAME
 
     last_user_idx = _find_last_user_idx(messages)
-    # Scan ALL messages (user + tool) for images: agent tools (Claude Code's
-    # Read) return images inside tool_result blocks, not in the current user turn.
-    all_images: list[str] = []
-    for m in messages:
-        if m.get("role") == "user":
-            _, imgs = _parse_content(m.get("content"))
-            all_images.extend(imgs)
-        elif m.get("role") == "tool" and isinstance(m.get("content"), list):
-            _, imgs = _parse_content(m.get("content"))
-            all_images.extend(imgs)
-    cur_images = all_images[-1:] if all_images else []  # keep the latest image
+    cur_images = _extract_current_images(messages)
     cur_text = _pick_focus_text(messages)
     logger.info(
         "anthropic route: msg_count=%d cur_text_len=%d cur_images=%d",

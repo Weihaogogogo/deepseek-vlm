@@ -105,6 +105,31 @@ def _pick_focus_text(messages: list) -> str:
     return "\n".join(parts)
 
 
+def _extract_current_images(messages: list) -> list[str]:
+    """Images belonging to the CURRENT turn only.
+
+    - Images in the last user message (user just attached them), else
+    - Images in the last message IF that message is a tool result (agent just
+      Read a file this turn).
+    History images (earlier turns) are intentionally ignored: they were
+    already processed when first sent; re-processing them on every later
+    text-only turn is what made follow-ups slow.
+    """
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            _, imgs = _parse_content(m.get("content"))
+            if imgs:
+                return imgs[-1:]
+            break
+    if messages and messages[-1].get("role") == "tool" and isinstance(
+        messages[-1].get("content"), list
+    ):
+        _, imgs = _parse_content(messages[-1].get("content"))
+        if imgs:
+            return imgs[-1:]
+    return []
+
+
 def _ensure_reasoning_content(messages: list) -> list:
     """deepseek thinking mode requires assistant tool_calls messages to carry
     reasoning_content back. Anthropic-format history has no such field, so pad
@@ -192,7 +217,7 @@ async def route_chat_completions(body: dict):
     if last_user_idx is None:
         raise ClientRequestError("messages must include at least one user message")
 
-    cur_images = _parse_content(messages[last_user_idx].get("content"))[1]
+    cur_images = _extract_current_images(messages)
     cur_text = _pick_focus_text(messages)
     logger.info(
         "route: last_user_idx=%d msg_count=%d cur_text_len=%d cur_images=%d",
