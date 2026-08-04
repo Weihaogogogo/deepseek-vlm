@@ -136,6 +136,38 @@ def _extract_current_images(messages: list) -> list[str]:
     return []
 
 
+def _normalize_tool_pairing(messages: list) -> list:
+    """deepseek requires tool messages to IMMEDIATELY follow the assistant
+    tool_calls they answer. Anthropic clients may interleave user text
+    messages between tool_use and tool_result (observed from Claude Code);
+    reorder so each tool message sits right after its matching assistant.
+    Unmatched tool messages are appended at the end as a fallback.
+    """
+    tools_by_id: dict[str, list] = {}
+    tool_order: list[str] = []
+    others: list[dict] = []
+    for m in messages:
+        if m.get("role") == "tool" and m.get("tool_call_id"):
+            tools_by_id.setdefault(m["tool_call_id"], []).append(m)
+            tool_order.append(m["tool_call_id"])
+        else:
+            others.append(m)
+    out: list[dict] = []
+    used: set[str] = set()
+    for m in others:
+        out.append(m)
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                tid = tc.get("id")
+                if tid in tools_by_id and tid not in used:
+                    out.extend(tools_by_id[tid])
+                    used.add(tid)
+    for tid in tool_order:
+        if tid not in used:
+            out.extend(tools_by_id[tid])
+    return out
+
+
 def _ensure_reasoning_content(messages: list) -> list:
     """deepseek thinking mode requires assistant tool_calls messages to carry
     reasoning_content back. Anthropic-format history has no such field, so pad
@@ -207,6 +239,7 @@ def _validate_messages(messages: list) -> None:
 
 
 async def _forward(messages: list, body: dict, model: str, stream: bool):
+    messages = _normalize_tool_pairing(messages)
     if stream:
         gen = await _llm.stream(messages, body, model)
         return StreamingResponse(gen, media_type="text/event-stream")

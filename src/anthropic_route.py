@@ -21,6 +21,7 @@ from .router import (
     VisionUnavailable,
     _ensure_reasoning_content,
     _extract_current_images,
+    _normalize_tool_pairing,
     _parse_content,
     _pick_focus_text,
     _strip_message_images,
@@ -151,6 +152,7 @@ async def route_messages(body: dict):
 
 async def _forward_anthropic(messages: list, params: dict, model: str, stream: bool):
     """Forward to deepseek and translate the response to Anthropic format."""
+    messages = _normalize_tool_pairing(messages)
     body_params = dict(params)
     if stream:
         try:
