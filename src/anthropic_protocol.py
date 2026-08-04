@@ -276,7 +276,8 @@ async def anthropic_sse(chunk_iter, model: str):
 
     sent_start = False
     text_index = None
-    tool_indices: dict[int, bool] = {}
+    tool_indices: dict[int, int] = {}  # deepseek tc.index -> anthropic block index
+    block_counter = 0
     usage = {"input_tokens": 0, "output_tokens": 0}
     stop_reason = None
     blocks_done = False
@@ -316,31 +317,16 @@ async def anthropic_sse(chunk_iter, model: str):
             )
             sent_start = True
 
-        if choice.finish_reason:
-            stop_reason = _stop_reason(choice.finish_reason)
-            # Anthropic requires a content_block_stop after each block's deltas.
-            if not blocks_done:
-                if text_index is not None:
-                    yield evt(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": text_index},
-                    )
-                for idx in sorted(tool_indices):
-                    yield evt(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": idx},
-                    )
-                blocks_done = True
-
         if delta:
             if delta.content:
                 if text_index is None:
-                    text_index = 0
+                    text_index = block_counter
+                    block_counter += 1
                     yield evt(
                         "content_block_start",
                         {
                             "type": "content_block_start",
-                            "index": 0,
+                            "index": text_index,
                             "content_block": {"type": "text", "text": ""},
                         },
                     )
@@ -348,24 +334,25 @@ async def anthropic_sse(chunk_iter, model: str):
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": text_index,
                         "delta": {"type": "text_delta", "text": delta.content},
                     },
                 )
             if delta.tool_calls:
                 for tc in delta.tool_calls:
-                    idx = tc.index or 0
+                    src_idx = tc.index or 0
                     fn = tc.function or {}
-                    if idx not in tool_indices:
-                        tool_indices[idx] = True
+                    if src_idx not in tool_indices:
+                        tool_indices[src_idx] = block_counter
+                        block_counter += 1
                         yield evt(
                             "content_block_start",
                             {
                                 "type": "content_block_start",
-                                "index": idx,
+                                "index": tool_indices[src_idx],
                                 "content_block": {
                                     "type": "tool_use",
-                                    "id": tc.id or f"toolu_{idx}",
+                                    "id": tc.id or f"toolu_{src_idx}",
                                     "name": fn.name or "",
                                     "input": {},
                                 },
@@ -376,10 +363,26 @@ async def anthropic_sse(chunk_iter, model: str):
                             "content_block_delta",
                             {
                                 "type": "content_block_delta",
-                                "index": idx,
+                                "index": tool_indices[src_idx],
                                 "delta": {"type": "input_json_delta", "partial_json": fn.arguments},
                             },
                         )
+
+        if choice.finish_reason:
+            stop_reason = _stop_reason(choice.finish_reason)
+            # Anthropic requires a content_block_stop after each block's deltas.
+            if not blocks_done:
+                if text_index is not None:
+                    yield evt(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": text_index},
+                    )
+                for idx in sorted(tool_indices.values()):
+                    yield evt(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": idx},
+                    )
+                blocks_done = True
 
     if not sent_start:
         # Empty stream: emit a minimal message so clients don't hang.
@@ -406,7 +409,7 @@ async def anthropic_sse(chunk_iter, model: str):
                 "content_block_stop",
                 {"type": "content_block_stop", "index": text_index},
             )
-        for idx in sorted(tool_indices):
+        for idx in sorted(tool_indices.values()):
             yield evt(
                 "content_block_stop",
                 {"type": "content_block_stop", "index": idx},
