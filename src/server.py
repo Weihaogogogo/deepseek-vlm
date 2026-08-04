@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from . import config
 from .llm_client import LLMBackendError
+from .anthropic_route import route_messages as route_anthropic_messages
 from .router import ClientRequestError, VisionUnavailable, route_chat_completions
 
 logging.basicConfig(
@@ -38,10 +39,15 @@ class AuthError(Exception):
 def _check_auth(request: Request) -> None:
     auth = request.headers.get("authorization", "")
     expected = config.FAKE_VLM_API_KEY
-    if not expected or not auth.startswith("Bearer "):
+    if not expected:
         raise AuthError
-    token = auth[len("Bearer "):].strip()
-    if not hmac.compare_digest(token, expected):
+    token = ""
+    if auth.startswith("Bearer "):
+        token = auth[len("Bearer "):].strip()
+    else:
+        # Anthropic clients often send x-api-key instead of Authorization.
+        token = request.headers.get("x-api-key", "")
+    if not token or not hmac.compare_digest(token, expected):
         raise AuthError
 
 
@@ -86,6 +92,54 @@ async def chat_completions(request: Request):
     if not isinstance(body, dict):
         return _error(400, "request body must be a JSON object", "invalid_request_error", "invalid_json")
     return await route_chat_completions(body)
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "invalid JSON body"},
+            },
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "request body must be a JSON object"},
+            },
+        )
+    try:
+        return await route_anthropic_messages(body)
+    except ClientRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": exc.message},
+            },
+        )
+    except VisionUnavailable:
+        return JSONResponse(
+            status_code=502,
+            content={"type": "error", "error": {"type": "api_error", "message": "vision backend unavailable"}},
+        )
+    except LLMBackendError as exc:
+        status = exc.status_code
+        try:
+            msg = exc.body.get("error", {}).get("message", "upstream error")
+        except AttributeError:
+            msg = "upstream error"
+        return JSONResponse(
+            status_code=status,
+            content={"type": "error", "error": {"type": "api_error", "message": msg}},
+        )
 
 
 def _check_config() -> None:

@@ -101,6 +101,27 @@ class DeepSeekClient:
             self._raise_backend(exc)
         return resp.model_dump()
 
+    async def stream_chunks(self, messages: list, body: dict):
+        """Streaming: returns the raw OpenAI chunk async iterable (for protocol adapters).
+
+        Upstream errors surface before the first chunk is yielded.
+        """
+        params = self._passthrough_params(body)
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self.model, messages=messages, stream=True, **params
+            )
+        except Exception as exc:
+            self._raise_backend(exc)
+        try:
+            async for chunk in stream:
+                yield chunk
+        except Exception as exc:
+            await stream.close()
+            self._raise_backend(exc)
+        finally:
+            await stream.close()
+
     async def stream(self, messages: list, body: dict, rewrite_model: str):
         """Streaming: SSE passthrough with the model field rewritten per chunk.
 

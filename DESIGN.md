@@ -155,3 +155,65 @@ fake-vlm/
 - VLM-2 位置描述（相对方位）与符号图行序是两套坐标，LLM 靠语义对应，交叉引用不精确
 - 人脸识别为 qwen3-vl-flash 模型层边界，"这是谁"类问题回答质量受限（prompts 已知边界）
 - 尾部怠工：长输出后「置信度:」可能虚高，影响有限暂不处理
+
+---
+
+# Anthropic 兼容端点（v1.1，2026-08-05）
+
+## 目标
+
+新增 `POST /v1/messages`（Anthropic Messages API 兼容），让 OpenCode 等 agent 工具以 anthropic 协议直连。内部路由逻辑（无图透传 / 有图双 VLM）完全复用，只做协议转换层。
+
+## 鉴权
+
+`Authorization: Bearer <FAKE_VLM_API_KEY>` 或 `x-api-key: <FAKE_VLM_API_KEY>` 均接受（Anthropic 客户端两种都常见）。
+
+## 请求解析（Anthropic → OpenAI 内部格式）
+
+| Anthropic | OpenAI 内部 |
+|---|---|
+| 顶层 `system`（字符串或 text 块数组） | 合并为 system 消息；有图时预制 llm_system.md 在其前 |
+| user content 字符串 | user content 字符串 |
+| user content 块 `{type:"text"}` | `{type:"text"}` |
+| user content 块 `{type:"image", source:{type:"base64", media_type, data}}` | `{type:"image_url", image_url:{url:"data:<media_type>;base64,<data>"}}` |
+| user content 块 `{type:"image", source:{type:"url", url}}` | `{type:"image_url", image_url:{url}}` |
+| user content 块 `{type:"tool_result", tool_use_id, content}` | 独立消息 `{role:"tool", tool_call_id, content}`（紧跟对应 assistant 消息） |
+| assistant content 字符串 | assistant content 字符串 |
+| assistant 块 `{type:"tool_use", id, name, input}` | assistant 消息 `tool_calls:[{id, type:"function", function:{name, arguments:json.dumps(input)}}]` |
+| assistant 块 `{type:"thinking", ...}` | 忽略（deepseek 不需要） |
+| `tools:[{name, description, input_schema}]` | `[{type:"function", function:{name, description, parameters}}]` |
+| `tool_choice: "auto"|"any"|"none"|{type:"tool", name}` | `"auto"|"required"|"none"|{type:"function", function:{name}}` |
+| `max_tokens`（必填） | 透传 |
+| `temperature`/`top_p`/`stop_sequences` | `temperature`/`top_p`/`stop` |
+| `top_k` | 忽略（OpenAI 协议无此参数） |
+
+## 响应转换（OpenAI → Anthropic）
+
+非流式：
+
+- OpenAI `choices[0].message.content` → `content: [{type:"text", text}]`
+- OpenAI `tool_calls` → `content: [{type:"tool_use", id, name, input: json.loads(arguments)}]`
+- `finish_reason`：stop→`end_turn`，tool_calls→`tool_use`，length→`max_tokens`
+- `usage.prompt_tokens/completion_tokens` → `input_tokens/output_tokens`
+- 顶层 `{id, type:"message", role:"assistant", model, stop_reason, stop_sequence:null, usage}`
+
+流式（OpenAI chunk → Anthropic SSE 事件）：
+
+| OpenAI chunk 内容 | Anthropic 事件 |
+|---|---|
+| 首个 chunk（role 声明） | `message_start`（含初始 usage 与 model） |
+| `delta.content` 增量 | `content_block_start(type:"text", index:0)`（首次）→ `content_block_delta(type:"text_delta", text)` |
+| `delta.tool_calls[i]`（id/name/arguments 片断） | `content_block_start(type:"tool_use", index:i, id, name)`（该 index 首次）→ `content_block_delta(type:"input_json_delta", partial_json)` |
+| `finish_reason` | `message_delta(delta:{stop_reason}, usage)` |
+| 流结束 | `message_stop` |
+| `reasoning_content` | 忽略（v1；deepseek 思考链不转 thinking 块，避免客户端未启用 thinking 时协议报错） |
+| 最终 `[DONE]` | 不输出（message_stop 已收尾） |
+
+## 错误格式
+
+Anthropic 风格：`{"type":"error","error":{"type":"api_error"|"invalid_request_error"|"authentication_error","message":...}}`
+映射：401→authentication_error；400→invalid_request_error；VLM 失败→502 api_error；deepseek 错误→原状态码+错误体转 Anthropic 格式。
+
+## 路由
+
+与 OpenAI 端点共用核心逻辑：最后一条 user 消息提取图片（image 块）；无图原样透传（system 不加预制 prompt）；有图双 VLM 并发 + 合并 + 预制 prompt 注入；文本 ≤1 字符跳过 VLM-2；历史消息图片剥离丢弃；多图取第一张告警；VLM 失败 502 不降级。

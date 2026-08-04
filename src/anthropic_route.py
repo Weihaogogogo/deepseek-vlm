@@ -1,0 +1,149 @@
+"""Anthropic /v1/messages route: reuses the OpenAI-format routing core.
+
+Request flow: parse Anthropic body -> OpenAI-format messages ->
+no-image: passthrough to deepseek (with Anthropic system prepended)
+image: dual-VLM + merge + LLM_SYSTEM injection -> forward.
+Response flow: OpenAI response -> Anthropic message / SSE events.
+"""
+import asyncio
+import logging
+
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from . import anthropic_protocol as ap
+from . import config, image_utils, merger
+from .anthropic_protocol import anthropic_error, anthropic_sse, to_anthropic_message
+from .image_utils import ImageParseError
+from .llm_client import LLMBackendError, DeepSeekClient
+from .router import (
+    PROMPTS_DIR,
+    ClientRequestError,
+    VisionUnavailable,
+    _parse_content,
+    _strip_message_images,
+    _validate_messages,
+)
+from .vlm_client import VLMClient
+
+logger = logging.getLogger(__name__)
+
+LLM_SYSTEM = (PROMPTS_DIR / "llm_system.md").read_text(encoding="utf-8")
+VLM1_SYSTEM = (PROMPTS_DIR / "vlm1_system.md").read_text(encoding="utf-8")
+VLM2_SYSTEM = (PROMPTS_DIR / "vlm2_system.md").read_text(encoding="utf-8")
+
+_llm = DeepSeekClient()
+_vlm = VLMClient(config.DASHSCOPE_API_KEY)
+
+_MODEL_NAME = "fake-vlm"
+
+
+def _find_last_user_idx(messages: list) -> int:
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user" and messages[i].get("content") is not None:
+            return i
+    raise ClientRequestError("messages must include at least one user message")
+
+
+def _prepend_system(messages: list, system_text: str) -> list:
+    """Return messages with the Anthropic top-level system as the first system message."""
+    if not system_text.strip():
+        return messages
+    out = [{"role": "system", "content": system_text}]
+    # Keep any explicit system messages from the parsed messages after it.
+    out.extend(m for m in messages if m.get("role") != "system")
+    out.extend(m for m in messages if m.get("role") == "system")
+    return out
+
+
+def _llm_error_response(exc: LLMBackendError):
+    """Convert an upstream deepseek error into an Anthropic error body."""
+    status = exc.status_code
+    try:
+        msg = exc.body.get("error", {}).get("message", "upstream error")
+    except AttributeError:
+        msg = "upstream error"
+    return JSONResponse(status_code=status, content=anthropic_error(status, msg))
+
+
+async def route_messages(body: dict):
+    try:
+        messages, params, system_text = ap.parse_body(body)
+    except ValueError as exc:
+        raise ClientRequestError(str(exc)) from exc
+
+    _validate_messages(messages)
+    stream = bool(body.get("stream", False))
+    model = body.get("model") or _MODEL_NAME
+
+    last_user_idx = _find_last_user_idx(messages)
+    cur_text, cur_images = _parse_content(messages[last_user_idx].get("content"))
+    logger.info(
+        "anthropic route: msg_count=%d cur_text_len=%d cur_images=%d",
+        len(messages),
+        len(cur_text),
+        len(cur_images),
+    )
+    if len(cur_images) > 1:
+        logger.warning("anthropic: %d images, keeping the first", len(cur_images))
+        cur_images = cur_images[:1]
+
+    if not cur_images:
+        fwd_messages = _prepend_system(messages, system_text)
+        return await _forward_anthropic(fwd_messages, params, model, stream)
+
+    try:
+        data_url = await image_utils.prepare_image(cur_images[0])
+    except ImageParseError as exc:
+        raise ClientRequestError(f"invalid image: {exc}", code="invalid_image") from exc
+
+    run_vlm2 = len(cur_text.strip()) > 1
+    tasks = [_vlm.describe_overall(VLM1_SYSTEM, data_url)]
+    if run_vlm2:
+        tasks.append(_vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    if isinstance(results[0], Exception):
+        logger.error("anthropic VLM-1 failed: %s", results[0])
+        raise VisionUnavailable from results[0]
+    overall = results[0]
+    focus = None
+    if run_vlm2:
+        if isinstance(results[1], Exception):
+            logger.error("anthropic VLM-2 failed: %s", results[1])
+            raise VisionUnavailable from results[1]
+        focus = results[1]
+
+    merged = merger.merge_image_info(overall, focus, cur_text)
+
+    new_messages: list[dict] = [{"role": "system", "content": LLM_SYSTEM}]
+    if system_text.strip():
+        new_messages.append({"role": "system", "content": system_text})
+    for i, message in enumerate(messages):
+        if i == last_user_idx:
+            new_messages.append({"role": "user", "content": merged})
+            continue
+        if message.get("role") == "system":
+            continue  # already handled above (merged into the system list)
+        stripped = _strip_message_images(message)
+        if stripped:
+            new_messages.append(stripped)
+
+    return await _forward_anthropic(new_messages, params, model, stream)
+
+
+async def _forward_anthropic(messages: list, params: dict, model: str, stream: bool):
+    """Forward to deepseek and translate the response to Anthropic format."""
+    body_params = dict(params)
+    if stream:
+        try:
+            chunk_iter = _llm.stream_chunks(messages, body_params)
+        except LLMBackendError as exc:
+            return _llm_error_response(exc)
+        return StreamingResponse(
+            anthropic_sse(chunk_iter, model), media_type="text/event-stream"
+        )
+    try:
+        data = await _llm.complete(messages, body_params)
+    except LLMBackendError as exc:
+        return _llm_error_response(exc)
+    return JSONResponse(content=to_anthropic_message(data, model))

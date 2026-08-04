@@ -135,6 +135,38 @@ async def route_chat_completions(body: dict):
         raise ClientRequestError("messages must include at least one user message")
 
     cur_text, cur_images = _parse_content(messages[last_user_idx].get("content"))
+    logger.info(
+        "route: last_user_idx=%d msg_count=%d cur_text_len=%d cur_images=%d",
+        last_user_idx,
+        len(messages),
+        len(cur_text),
+        len(cur_images),
+    )
+    if not cur_images:
+        # Log message content structure to diagnose client image formats.
+        try:
+            structure = [
+                {
+                    "role": m.get("role"),
+                    "content_type": (
+                        type(m.get("content")).__name__
+                        if m.get("content") is not None
+                        else None
+                    ),
+                    "part_types": (
+                        [p.get("type") for p in m["content"] if isinstance(p, dict)]
+                        if isinstance(m.get("content"), list)
+                        else None
+                    ),
+                    "keys": (
+                        list(m["content"][0].keys()) if isinstance(m.get("content"), list) and m["content"] else None
+                    ),
+                }
+                for m in messages
+            ]
+            logger.info("no image detected; message structure=%s", structure)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("structure log failed: %s", exc)
     if len(cur_images) > 1:
         logger.warning(
             "current turn has %d images; keeping the first, discarding the rest",
