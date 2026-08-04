@@ -153,11 +153,23 @@ async def _forward_anthropic(messages: list, params: dict, model: str, stream: b
             return _llm_error_response(exc)
 
         async def _stream_with_error_log():
+            started = False
             try:
                 async for line in anthropic_sse(chunk_iter, model):
+                    started = started or "message_start" in line
                     yield line
             except LLMBackendError as exc:
                 _log_message_pairs(messages, exc)
+                if not started:
+                    # Nothing sent yet: emit an Anthropic error event so the
+                    # client gets a parseable failure instead of a dead stream.
+                    import json as _json
+
+                    yield (
+                        "event: error\n"
+                        f"data: {_json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': 'upstream error'}}, ensure_ascii=False)}\n\n"
+                    )
+                    return
                 raise
 
         return StreamingResponse(

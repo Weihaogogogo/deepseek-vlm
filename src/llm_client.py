@@ -47,8 +47,18 @@ class DeepSeekClient:
         self.model = config.DEEPSEEK_MODEL
 
     @staticmethod
-    def _passthrough_params(body: dict) -> dict:
-        return {k: v for k, v in body.items() if k in _PASSTHROUGH_PARAMS and v is not None}
+    def _passthrough_params(body: dict, stream: bool = False) -> dict:
+        params = {k: v for k, v in body.items() if k in _PASSTHROUGH_PARAMS and v is not None}
+        if stream:
+            # Always request usage in streamed responses — clients (Claude
+            # Code's /context, token accounting) rely on per-response counts.
+            # NOTE: deepseek rejects stream_options on non-streaming calls.
+            so = params.get("stream_options")
+            if so is None:
+                params["stream_options"] = {"include_usage": True}
+            elif not so.get("include_usage"):
+                params["stream_options"] = {**so, "include_usage": True}
+        return params
 
     @staticmethod
     def _extract_error(exc: Exception) -> tuple[int, dict]:
@@ -106,7 +116,7 @@ class DeepSeekClient:
 
         Upstream errors surface before the first chunk is yielded.
         """
-        params = self._passthrough_params(body)
+        params = self._passthrough_params(body, stream=True)
         try:
             stream = await self._client.chat.completions.create(
                 model=self.model, messages=messages, stream=True, **params
@@ -128,7 +138,7 @@ class DeepSeekClient:
         Fetches the first chunk eagerly so upstream errors surface before the
         response starts; returns an async generator of SSE lines.
         """
-        params = self._passthrough_params(body)
+        params = self._passthrough_params(body, stream=True)
         try:
             stream = await self._client.chat.completions.create(
                 model=self.model, messages=messages, stream=True, **params

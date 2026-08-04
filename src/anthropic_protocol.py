@@ -285,12 +285,14 @@ async def anthropic_sse(chunk_iter, model: str):
         return f"event: {name}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
     async for chunk in chunk_iter:
+        # deepseek attaches usage to the FINAL chunk (choices may be non-empty);
+        # OpenAI-standard "empty choices + usage" chunks are handled below too.
+        if chunk.usage:
+            usage = {
+                "input_tokens": getattr(chunk.usage, "prompt_tokens", 0),
+                "output_tokens": getattr(chunk.usage, "completion_tokens", 0),
+            }
         if not chunk.choices:
-            if chunk.usage:
-                usage = {
-                    "input_tokens": getattr(chunk.usage, "prompt_tokens", 0),
-                    "output_tokens": getattr(chunk.usage, "completion_tokens", 0),
-                }
             continue
         choice = chunk.choices[0]
         delta = choice.delta

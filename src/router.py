@@ -211,6 +211,9 @@ async def _forward(messages: list, body: dict, model: str, stream: bool):
         gen = await _llm.stream(messages, body, model)
         return StreamingResponse(gen, media_type="text/event-stream")
     data = await _llm.complete(messages, body)
+    # Keep the model field consistent with what the client requested (streaming
+    # chunks already rewrite it; non-streaming must match).
+    data["model"] = model
     return JSONResponse(content=data)
 
 
