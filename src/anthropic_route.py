@@ -19,7 +19,9 @@ from .router import (
     PROMPTS_DIR,
     ClientRequestError,
     VisionUnavailable,
+    _ensure_reasoning_content,
     _parse_content,
+    _pick_focus_text,
     _strip_message_images,
     _validate_messages,
 )
@@ -35,31 +37,6 @@ _llm = DeepSeekClient()
 _vlm = VLMClient(config.DASHSCOPE_API_KEY)
 
 _MODEL_NAME = config.DEEPSEEK_MODEL
-
-
-def _pick_focus_text(messages: list) -> str:
-    """Best user text for VLM-2 focus.
-
-    Uses the last substantive user message. If it is very short (likely a
-    referential follow-up like "还有呢？" whose semantics live earlier),
-    prepend the previous user message (truncated) as context. Tool messages
-    never contribute (tool_result blocks are role=tool after parsing).
-    """
-    candidates: list[str] = []
-    for m in messages:
-        if m.get("role") == "user":
-            t, _ = _parse_content(m.get("content"))
-            if t and t.strip():
-                candidates.append(t.strip())
-    if not candidates:
-        return ""
-    focus = candidates[-1]
-    if len(focus) <= 4 and len(candidates) >= 2:
-        prev = candidates[-2]
-        if len(prev) > 150:
-            prev = prev[:150] + "…"
-        focus = f"{prev} → {focus}"
-    return focus
 
 
 def _find_last_user_idx(messages: list) -> int:
@@ -129,6 +106,7 @@ async def route_messages(body: dict):
             s = _strip_message_images(message)
             if s is not None:
                 stripped.append(s)
+        stripped = _ensure_reasoning_content(stripped)
         fwd_messages = _prepend_system(stripped, system_text)
         return await _forward_anthropic(fwd_messages, params, model, stream)
 
@@ -169,6 +147,7 @@ async def route_messages(body: dict):
         if stripped:
             new_messages.append(stripped)
 
+    new_messages = _ensure_reasoning_content(new_messages)
     return await _forward_anthropic(new_messages, params, model, stream)
 
 

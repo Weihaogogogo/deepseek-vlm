@@ -71,8 +71,63 @@ def _parse_content(content) -> tuple[str, list[str]]:
     raise ClientRequestError("invalid message content")
 
 
+FOCUS_BUDGET_CHARS = 1000
+
+
+def _pick_focus_text(messages: list) -> str:
+    """Recent conversational context for VLM-2 focus.
+
+    Scans user + assistant messages newest-first, accumulating text until the
+    char budget is exhausted, then returns the collected context in
+    chronological order with role prefixes. This covers agent self-talk — an
+    assistant message like "I need to check image X before deciding" carries
+    the real intent of the current agent loop, which the latest user message
+    alone may not express. Tool messages never contribute (tool_result blocks
+    are role=tool after parsing).
+    """
+    chunks: list[tuple[bool, str]] = []  # (is_user, text), newest first
+    total = 0
+    for m in reversed(messages):
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        t, _ = _parse_content(m.get("content"))
+        t = t.strip()
+        if not t:
+            continue
+        if chunks and total + len(t) > FOCUS_BUDGET_CHARS:
+            break  # budget exhausted; do not scan further back
+        chunks.append((m.get("role") == "user", t))
+        total += len(t)
+    if not chunks:
+        return ""
+    chunks.reverse()  # chronological order
+    parts = [f"用户: {t}" if is_user else f"助手: {t}" for is_user, t in chunks]
+    return "\n".join(parts)
+
+
+def _ensure_reasoning_content(messages: list) -> list:
+    """deepseek thinking mode requires assistant tool_calls messages to carry
+    reasoning_content back. Anthropic-format history has no such field, so pad
+    it with an empty string when missing (empty string is accepted)."""
+    out = []
+    for m in messages:
+        if (
+            m.get("role") == "assistant"
+            and m.get("tool_calls")
+            and "reasoning_content" not in m
+        ):
+            out.append({**m, "reasoning_content": ""})
+        else:
+            out.append(m)
+    return out
+
+
 def _strip_message_images(message: dict):
-    """Returns the message with image parts removed, or None if it becomes empty."""
+    """Returns the message with image parts removed, or None if it becomes empty.
+
+    Text-only arrays are flattened to plain strings (deepseek's compatibility
+    layer rejects array content on tool/assistant messages).
+    """
     content = message.get("content")
     if content is None:
         return message if message.get("tool_calls") else None
@@ -84,13 +139,16 @@ def _strip_message_images(message: dict):
             for part in content
             if not (isinstance(part, dict) and part.get("type") == "image_url")
         ]
-        if kept:
-            return {**message, "content": kept}
-        logger.warning(
-            "dropping history message (role=%s) whose content was only an image",
-            message.get("role"),
-        )
-        return None
+        if not kept:
+            logger.warning(
+                "dropping history message (role=%s) whose content was only an image",
+                message.get("role"),
+            )
+            return None
+        if all(isinstance(p, dict) and p.get("type") == "text" for p in kept):
+            texts = [p.get("text", "") for p in kept]
+            return {**message, "content": "".join(texts)}
+        return {**message, "content": kept}
     return message
 
 
@@ -134,7 +192,8 @@ async def route_chat_completions(body: dict):
     if last_user_idx is None:
         raise ClientRequestError("messages must include at least one user message")
 
-    cur_text, cur_images = _parse_content(messages[last_user_idx].get("content"))
+    cur_images = _parse_content(messages[last_user_idx].get("content"))[1]
+    cur_text = _pick_focus_text(messages)
     logger.info(
         "route: last_user_idx=%d msg_count=%d cur_text_len=%d cur_images=%d",
         last_user_idx,
@@ -175,14 +234,12 @@ async def route_chat_completions(body: dict):
         cur_images = cur_images[:1]
 
     if not cur_images:
-        # No image in the current turn: forward untouched, no system injection.
-        # BUT strip images from history messages — deepseek's compatibility
-        # layer rejects image_url content anywhere in the payload.
         stripped = []
         for message in messages:
             s = _strip_message_images(message)
             if s is not None:
                 stripped.append(s)
+        stripped = _ensure_reasoning_content(stripped)
         return await _forward(stripped, body, model, stream)
 
     try:
@@ -231,4 +288,5 @@ async def route_chat_completions(body: dict):
             if stripped:
                 new_messages.append(stripped)
 
+    new_messages = _ensure_reasoning_content(new_messages)
     return await _forward(new_messages, body, model, stream)

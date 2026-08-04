@@ -54,8 +54,8 @@ class VLMClient:
         return await self._complete(system_prompt, [self._image_part(data_url)])
 
     async def describe_focus(self, system_prompt: str, data_url: str, question: str) -> str:
-        """VLM-2: image + wrapped question; retries once if the header is missing."""
-        text = f"用户提问：「{question}」\n请按系统规范输出聚焦描述。"
+        """VLM-2: image + wrapped context; retries once if the header is missing."""
+        text = f"对话上下文（最新用户提问在末尾）：\n{question}\n请按系统规范输出聚焦描述。"
         content = await self._complete(
             system_prompt, [self._image_part(data_url), self._text_part(text)]
         )
