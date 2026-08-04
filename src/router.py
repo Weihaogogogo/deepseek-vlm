@@ -239,6 +239,11 @@ def _strip_message_images(message: dict):
 
     Text-only arrays are flattened to plain strings (deepseek's compatibility
     layer rejects array content on tool/assistant messages).
+
+    Tool messages whose content was ONLY an image get the cached VLM
+    description written in as their text — otherwise deepseek sees an empty
+    tool result and concludes "read_file returned nothing" (observed from
+    Claude Code reading PNGs: its tool_result is a bare image block).
     """
     content = message.get("content")
     if content is None:
@@ -246,6 +251,13 @@ def _strip_message_images(message: dict):
     if isinstance(content, str):
         return message
     if isinstance(content, list):
+        img_keys = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url = part.get("image_url")
+                u = url.get("url") if isinstance(url, dict) else None
+                if isinstance(u, str) and u:
+                    img_keys.append(image_utils.image_hash(u))
         kept = [
             part
             for part in content
@@ -253,9 +265,11 @@ def _strip_message_images(message: dict):
         ]
         if not kept:
             if message.get("role") == "tool":
-                # Tool messages MUST survive even empty: they pair with the
-                # preceding assistant tool_calls. deepseek rejects orphan
-                # tool_calls (assistant tool_calls without matching tool msg).
+                # Image-only tool result: fill with the cached description so
+                # the backend sees content, not an empty tool message.
+                for key in img_keys:
+                    if key in _DESC_CACHE:
+                        return {**message, "content": _DESC_CACHE[key]}
                 return {**message, "content": ""}
             logger.warning(
                 "dropping history message (role=%s) whose content was only an image",
