@@ -171,11 +171,11 @@ def _extract_current_images(messages: list) -> list[str]:
         if m.get("role") == "user":
             content = m.get("content")
             if content is None:
-                break
+                continue  # skip content-less user messages, keep scanning
             _, imgs = _parse_content(content)
             if imgs:
                 return imgs[-1:]
-            break
+            continue  # no image in this user message, keep scanning backwards
     if messages and messages[-1].get("role") == "tool" and isinstance(
         messages[-1].get("content"), list
     ):
@@ -322,14 +322,14 @@ async def route_chat_completions(body: dict):
     stream = bool(body.get("stream", False))
     model = body.get("model") or config.DEEPSEEK_MODEL
 
-    last_user_idx = next(
-        (
-            i
-            for i, m in enumerate(messages)
-            if m.get("role") == "user" and m.get("content") is not None
-        ),
-        None,
-    )
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if (
+            messages[i].get("role") == "user"
+            and messages[i].get("content") is not None
+        ):
+            last_user_idx = i
+            break
     if last_user_idx is None:
         raise ClientRequestError("messages must include at least one user message")
 
@@ -342,6 +342,29 @@ async def route_chat_completions(body: dict):
         len(cur_text),
         len(cur_images),
     )
+    if cur_images:
+        try:
+            layout = [
+                {
+                    "i": i,
+                    "role": m.get("role"),
+                    "ctype": type(m.get("content")).__name__ if m.get("content") is not None else "None",
+                    "txt": (
+                        (m["content"][:60] if isinstance(m.get("content"), str) else "")
+                        if isinstance(m.get("content"), str)
+                        else None
+                    ),
+                }
+                for i, m in enumerate(messages)
+            ]
+            logger.info(
+                "image url: %s... hash=%s layout=%s",
+                cur_images[0][:60],
+                image_utils.image_hash(cur_images[0])[:16],
+                layout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("image url log failed: %s", exc)
     if not cur_images:
         # Log message content structure to diagnose client image formats.
         try:
@@ -355,6 +378,15 @@ async def route_chat_completions(body: dict):
                     ),
                     "part_types": (
                         [p.get("type") for p in m["content"] if isinstance(p, dict)]
+                        if isinstance(m.get("content"), list)
+                        else None
+                    ),
+                    "img_part": (
+                        [
+                            str(p)[:150]
+                            for p in m["content"]
+                            if isinstance(p, dict) and p.get("type") == "image_url"
+                        ][:1]
                         if isinstance(m.get("content"), list)
                         else None
                     ),
