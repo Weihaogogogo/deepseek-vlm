@@ -53,7 +53,7 @@ def _collect(chunks):
 
     async def run():
         events = []
-        async for line in anthropic_sse(_iter_chunks(chunks), "deepseek-v4-flash"):
+        async for line in anthropic_sse(_iter_chunks(chunks), "deepseek-v4-flash-vl"):
             name_line, _, data_line = line.partition("\n")
             name = name_line.split(": ", 1)[1].strip()
             events.append((name, json.loads(data_line.split(": ", 1)[1])))
@@ -222,10 +222,10 @@ class TestToAnthropicMessage:
         }
 
     def test_text_content_usage_and_model(self):
-        out = to_anthropic_message(self._resp(content="你好"), "deepseek-v4-flash")
+        out = to_anthropic_message(self._resp(content="你好"), "deepseek-v4-flash-vl")
         assert out["type"] == "message"
         assert out["role"] == "assistant"
-        assert out["model"] == "deepseek-v4-flash"
+        assert out["model"] == "deepseek-v4-flash-vl"
         assert out["content"] == [{"type": "text", "text": "你好"}]
         assert out["usage"] == {"input_tokens": 10, "output_tokens": 5}
         assert out["stop_sequence"] is None
@@ -282,7 +282,7 @@ class TestAnthropicSse:
             "message_stop",
         ]
         # message_start 携带初始消息骨架
-        assert events[0][1]["message"]["model"] == "deepseek-v4-flash"
+        assert events[0][1]["message"]["model"] == "deepseek-v4-flash-vl"
         # 文本块 index 0
         assert events[1][1]["index"] == 0
         assert events[1][1]["content_block"]["type"] == "text"

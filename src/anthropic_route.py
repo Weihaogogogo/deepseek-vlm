@@ -44,7 +44,7 @@ VLM2_SYSTEM = (PROMPTS_DIR / "vlm2_system.md").read_text(encoding="utf-8")
 _llm = DeepSeekClient()
 _vlm = VLMClient(config.DASHSCOPE_API_KEY)
 
-_MODEL_NAME = config.DEEPSEEK_MODEL
+_MODEL_NAME = config.PUBLIC_MODEL_NAME
 
 
 def _find_last_user_idx(messages: list) -> int:

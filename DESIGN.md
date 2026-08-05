@@ -1,11 +1,11 @@
-# fake-vlm API 节点设计（v2）
+# deepseek-vlm API 节点设计（v2）
 
 ## 目标
 
 对外提供 **OpenAI 兼容 HTTP API** 与 **Anthropic Messages 兼容端点**，客户端可把它当作 deepseek 直接调用（换 base_url 即用）：
 
-- **无图请求**：原样透传 deepseek-v4-flash，零额外延迟，不注入任何东西（历史含图且缓存命中时，注入最近一张历史图描述，见「图片描述缓存」）
-- **有图请求**：并发调用两个 qwen3-vl-flash 描述画面 → 合并 → 注入预制 prompt → 转发 deepseek-v4-flash
+- **无图请求**：原样透传 deepseek-v4-flash-vl，零额外延迟，不注入任何东西（历史含图且缓存命中时，注入最近一张历史图描述，见「图片描述缓存」）
+- **有图请求**：并发调用两个 qwen3-vl-flash 描述画面 → 合并 → 注入预制 prompt → 转发 deepseek-v4-flash-vl
 - **多图支持（v2）**：每轮最多 10 张，编号按原始发送顺序，同轮按图片内容哈希去重；兼容 WorkBuddy 式「图片消息 + 文本消息分离」的形态
 
 ## 非目标（v1/v2 不做）
@@ -17,7 +17,7 @@
 ## 技术栈
 
 - Python 3.11 + FastAPI + uvicorn（服务）
-- openai SDK（调 qwen3-vl-flash 与 deepseek-v4-flash）
+- openai SDK（调 qwen3-vl-flash 与 deepseek-v4-flash-vl）
 - Pillow（图片压缩到 1024 长边）
 - python-dotenv（配置）
 
@@ -50,7 +50,7 @@ Anthropic Messages 兼容端点，见下文专节。
 
 ### 鉴权
 
-`Authorization: Bearer <FAKE_VLM_API_KEY>` 或 `x-api-key: <FAKE_VLM_API_KEY>`（Anthropic 客户端两种都常见），常量比对；缺失/错误返回 401，错误体 OpenAI 格式。
+`Authorization: Bearer <DEEPSEEK_VLM_API_KEY>` 或 `x-api-key: <DEEPSEEK_VLM_API_KEY>`（Anthropic 客户端两种都常见），常量比对；缺失/错误返回 401，错误体 OpenAI 格式。
 
 ### 错误码
 
@@ -126,11 +126,11 @@ deepseek 的 prefix cache 对「请求开头部分」命中；请求头部任何
 ## 配置（.env，项目根目录）
 
 ```
-FAKE_VLM_API_KEY=<对外鉴权 key，自签>
+DEEPSEEK_VLM_API_KEY=<对外鉴权 key，自签>
 DASHSCOPE_API_KEY=<已提供>
 DEEPSEEK_API_KEY=<服务器 ~/.hermes/.env 已有>
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MODEL=deepseek-v4-flash-vl
 PORT=8000
 ```
 
@@ -139,7 +139,7 @@ PORT=8000
 ## 文件结构
 
 ```
-fake-vlm/
+deepseek-vlm/
 ├── prompts/          # vlm1/vlm2/llm system，代码只读不写
 ├── src/
 │   ├── server.py             # FastAPI 入口 + 鉴权 + 50MB body 限制 + 路由分发
@@ -213,7 +213,7 @@ v2 增补：多图（10 张/顺序编号/同轮去重）、WorkBuddy 双 user �
 
 ## 鉴权
 
-`Authorization: Bearer <FAKE_VLM_API_KEY>` 或 `x-api-key: <FAKE_VLM_API_KEY>` 均接受（Anthropic 客户端两种都常见）。
+`Authorization: Bearer <DEEPSEEK_VLM_API_KEY>` 或 `x-api-key: <DEEPSEEK_VLM_API_KEY>` 均接受（Anthropic 客户端两种都常见）。
 
 ## 请求解析（Anthropic → OpenAI 内部格式）
 

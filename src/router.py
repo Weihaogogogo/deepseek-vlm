@@ -377,7 +377,7 @@ async def route_chat_completions(body: dict):
     stream = _parse_stream(body.get("stream", False))
     model = body.get("model")
     if model is None or model == "":
-        model = config.DEEPSEEK_MODEL
+        model = config.PUBLIC_MODEL_NAME
     elif not isinstance(model, str):
         raise ClientRequestError("model must be a string", code="invalid_model")
 

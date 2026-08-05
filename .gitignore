@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
 tests/*.png
 tests/*.jpg

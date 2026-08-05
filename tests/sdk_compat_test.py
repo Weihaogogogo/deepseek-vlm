@@ -1,4 +1,4 @@
-"""SDK 合规测试：用官方 anthropic / openai SDK 端到端验证 fake-vlm。
+"""SDK 合规测试：用官方 anthropic / openai SDK 端到端验证 deepseek-vlm。
 
 SDK 是最严格的"客户端"——按规范解析所有字段和事件序列，SDK 能过 =
 绝大多数真实客户端能过。覆盖非流式/流式/图片/工具/多轮/错误处理。
@@ -11,7 +11,7 @@ import urllib.request
 
 BASE = "http://127.0.0.1:8000"
 KEY = "fk-local-dev-8f3a2c91"
-MODEL = "deepseek-v4-flash"
+MODEL = "deepseek-v4-flash-vl"
 
 PASS = 0
 FAIL = 0

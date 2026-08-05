@@ -6,7 +6,7 @@ import urllib.request
 
 BASE = "http://127.0.0.1:8000/v1"
 KEY = "fk-local-dev-8f3a2c91"
-MODEL = "deepseek-v4-flash"
+MODEL = "deepseek-v4-flash-vl"
 
 from openai import OpenAI
 

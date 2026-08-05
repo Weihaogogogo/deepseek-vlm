@@ -113,6 +113,14 @@ async def _download(url: str) -> bytes:
 def _process_image(data: bytes) -> str:
     try:
         img = Image.open(io.BytesIO(data))
+        # JPEG: draft() uses libjpeg scale-down decoding (1/2, 1/4, 1/8) —
+        # decodes only ~2x the target size instead of the full resolution.
+        # Big screenshots are the slow path; this cuts decode time 4-16x.
+        if img.format == "JPEG":
+            try:
+                img.draft("RGB", (MAX_LONG_EDGE * 2, MAX_LONG_EDGE * 2))
+            except Exception:  # noqa: BLE001
+                pass
         img.load()
     except Exception as exc:
         raise ImageParseError(f"not a decodable image: {exc}") from exc
@@ -125,10 +133,13 @@ def _process_image(data: bytes) -> str:
     long_edge = max(width, height)
     if long_edge > MAX_LONG_EDGE:
         scale = MAX_LONG_EDGE / long_edge
-        img = img.resize(
-            (max(1, round(width * scale)), max(1, round(height * scale))),
-            Image.Resampling.LANCZOS,
-        )
+        target = (max(1, round(width * scale)), max(1, round(height * scale)))
+        if long_edge > MAX_LONG_EDGE * 2:
+            # Two-step downscale: cheap BILINEAR to ~2x target, then LANCZOS
+            # for the final size (LANCZOS on the full image is the slow part).
+            mid = (max(1, round(width * 2 * scale)), max(1, round(height * 2 * scale)))
+            img = img.resize(mid, Image.Resampling.BILINEAR)
+        img = img.resize(target, Image.Resampling.LANCZOS)
 
     out = io.BytesIO()
     if fmt == "PNG" and img.mode == "RGBA":

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 MAX_BODY_BYTES = 50 * 1024 * 1024
 
 app = FastAPI(
-    title="fake-vlm",
+    title="deepseek-vlm",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -32,6 +32,9 @@ async def _limit_body_size(request: Request, call_next):
     """Reject request bodies over 50MB with a 413 before the route parses them."""
     if request.url.path not in ("/v1/chat/completions", "/v1/messages"):
         return await call_next(request)
+    import time as _time
+
+    t_header = _time.monotonic()
     size = 0
     chunks: list[bytes] = []
     async for chunk in request.stream():
@@ -55,9 +58,20 @@ async def _limit_body_size(request: Request, call_next):
                 "payload_too_large",
             )
         chunks.append(chunk)
+    t_body_done = _time.monotonic()
     # Cache the read body so the route's request.json() does not re-read the stream.
     request._body = b"".join(chunks)
-    return await call_next(request)
+    resp = await call_next(request)
+    t_done = _time.monotonic()
+    logger.info(
+        "[timing] %s size=%.1fKB header_to_body=%.2fs body_to_done=%.2fs total=%.2fs",
+        request.url.path,
+        size / 1024,
+        t_body_done - t_header,
+        t_done - t_body_done,
+        t_done - t_header,
+    )
+    return resp
 
 
 def _error(status: int, message: str, type_: str, code: str) -> JSONResponse:
@@ -73,7 +87,7 @@ class AuthError(Exception):
 
 def _check_auth(request: Request) -> None:
     auth = request.headers.get("authorization", "")
-    expected = config.FAKE_VLM_API_KEY
+    expected = config.DEEPSEEK_VLM_API_KEY
     if not expected:
         raise AuthError
     token = ""
@@ -109,10 +123,16 @@ async def _llm_error_handler(request: Request, exc: LLMBackendError):
 @app.get("/v1/models")
 async def list_models(request: Request):
     _check_auth(request)
+    # 对外模型列表：PUBLIC_MODEL_NAME（deepseek-v4-flash-vl）在前，
+    # 上游模型名 deepseek-v4-flash 保留用于兼容旧客户端配置。
+    ids = [config.PUBLIC_MODEL_NAME, config.DEEPSEEK_MODEL]
     return JSONResponse(
         content={
             "object": "list",
-            "data": [{"id": config.DEEPSEEK_MODEL, "object": "model", "owned_by": config.DEEPSEEK_MODEL}],
+            "data": [
+                {"id": mid, "object": "model", "owned_by": mid}
+                for mid in dict.fromkeys(ids)
+            ],
         }
     )
 
@@ -198,7 +218,7 @@ async def anthropic_messages(request: Request):
 
 def _check_config() -> None:
     missing = [k for k, v in {
-        "FAKE_VLM_API_KEY": config.FAKE_VLM_API_KEY,
+        "DEEPSEEK_VLM_API_KEY": config.DEEPSEEK_VLM_API_KEY,
         "DASHSCOPE_API_KEY": config.DASHSCOPE_API_KEY,
         "DEEPSEEK_API_KEY": config.DEEPSEEK_API_KEY,
     }.items() if not v]

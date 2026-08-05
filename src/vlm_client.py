@@ -8,12 +8,14 @@ logger = logging.getLogger(__name__)
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 VLM_MODEL = "qwen3-vl-flash"
-VLM_TIMEOUT = 120.0
+# 正常调用 2-5s；dashscope 偶发 TCP 半挂起（连接不关、无数据）。30s 足够区分
+# "慢"与"死"，配合重试把单图最坏耗时压到 ~90s 内（客户端等得起）。
+VLM_TIMEOUT = 30.0
 
 VLM2_HEADER = "# 聚焦描述"
 VLM2_RETRY_PROMPT = "你没有按规范输出，请严格遵守系统规范，只输出聚焦描述"
 
-_MAX_CONCURRENCY = 4
+_MAX_CONCURRENCY = 60
 _MAX_RETRIES = 2
 _RETRY_BACKOFF_SECONDS = (1.0, 2.0)
 
