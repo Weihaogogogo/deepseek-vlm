@@ -130,7 +130,8 @@ DEEPSEEK_VLM_API_KEY=<对外鉴权 key，自签>
 DASHSCOPE_API_KEY=<已提供>
 DEEPSEEK_API_KEY=<服务器 ~/.hermes/.env 已有>
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash-vl
+DEEPSEEK_MODEL=deepseek-v4-flash
+PUBLIC_MODEL_NAME=deepseek-v4-flash-vl
 PORT=8000
 ```
 
