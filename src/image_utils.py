@@ -3,7 +3,10 @@ import asyncio
 import base64
 import hashlib
 import io
+import ipaddress
 import logging
+import socket
+from urllib.parse import urlparse
 
 import httpx
 from PIL import Image
@@ -13,6 +16,9 @@ logger = logging.getLogger(__name__)
 MAX_LONG_EDGE = 1024
 JPEG_QUALITY = 85
 DOWNLOAD_TIMEOUT = httpx.Timeout(30.0)
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+MAX_REDIRECTS = 5
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
 class ImageParseError(Exception):
@@ -31,12 +37,75 @@ def _parse_data_url(url: str) -> bytes:
         raise ImageParseError(f"invalid base64 data url: {exc}") from exc
 
 
-async def _download(url: str) -> bytes:
+def _is_blocked_address(ip: str) -> bool:
+    """True for loopback / RFC1918 / link-local / unspecified / ULA addresses."""
+    addr = ipaddress.ip_address(ip)
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if addr.version == 4:
+        return (
+            addr.is_loopback
+            or addr.is_private
+            or addr.is_link_local
+            or addr.is_unspecified
+        )
+    return (
+        addr.is_loopback or addr.is_link_local or addr.is_private or addr.is_unspecified
+    )
+
+
+async def _validate_url(url: str) -> None:
+    """Reject URLs whose hostname resolves to private/reserved addresses (SSRF guard)."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ImageParseError(f"unsupported url: {url[:120]}")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return resp.content
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, parsed.hostname, port, type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as exc:
+        raise ImageParseError(f"failed to resolve image host: {parsed.hostname}") from exc
+    if not infos:
+        raise ImageParseError(f"failed to resolve image host: {parsed.hostname}")
+    for info in infos:
+        ip = info[4][0]
+        if _is_blocked_address(ip):
+            raise ImageParseError(
+                f"blocked address (private/reserved): {ip} for host {parsed.hostname}"
+            )
+
+
+async def _download(url: str) -> bytes:
+    """Download with SSRF guard (entry + every redirect target) and a 20MB cap."""
+    current = url
+    try:
+        for _ in range(MAX_REDIRECTS + 1):
+            await _validate_url(current)
+            async with httpx.AsyncClient(
+                timeout=DOWNLOAD_TIMEOUT, follow_redirects=False
+            ) as client:
+                async with client.stream("GET", current) as resp:
+                    if resp.status_code in _REDIRECT_STATUSES:
+                        loc = resp.headers.get("location")
+                        if not loc:
+                            raise ImageParseError(
+                                f"redirect without location header: {current}"
+                            )
+                        current = str(httpx.URL(current).join(loc))
+                        continue
+                    resp.raise_for_status()
+                    chunks: list[bytes] = []
+                    size = 0
+                    async for chunk in resp.aiter_bytes():
+                        size += len(chunk)
+                        if size > MAX_DOWNLOAD_BYTES:
+                            raise ImageParseError(
+                                f"image exceeds {MAX_DOWNLOAD_BYTES} byte limit"
+                            )
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+        raise ImageParseError(f"too many redirects downloading: {url}")
     except httpx.HTTPError as exc:
         raise ImageParseError(f"failed to download image: {exc}") from exc
 

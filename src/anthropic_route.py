@@ -21,12 +21,14 @@ from .router import (
     VisionUnavailable,
     _DESC_CACHE,
     _cache_desc,
+    _desc_cache_key,
     _ensure_reasoning_content,
     _extract_current_images,
     _find_cached_history_image,
     _inject_history_description,
     _normalize_tool_pairing,
     _parse_content,
+    _parse_stream,
     _pick_focus_text,
     _strip_message_images,
     _validate_messages,
@@ -80,8 +82,12 @@ async def route_messages(body: dict):
         raise ClientRequestError(str(exc)) from exc
 
     _validate_messages(messages)
-    stream = bool(body.get("stream", False))
-    model = body.get("model") or _MODEL_NAME
+    stream = _parse_stream(body.get("stream", False))
+    model = body.get("model")
+    if model is None or model == "":
+        model = _MODEL_NAME
+    elif not isinstance(model, str):
+        raise ClientRequestError("model must be a string", code="invalid_model")
 
     last_user_idx = _find_last_user_idx(messages)
     cur_images = _extract_current_images(messages)
@@ -106,39 +112,40 @@ async def route_messages(body: dict):
         fwd_messages = _prepend_system(stripped, system_text)
         return await _forward_anthropic(fwd_messages, params, model, stream)
 
-    try:
-        data_urls = await asyncio.gather(
-            *[image_utils.prepare_image(url) for url in cur_images]
-        )
-    except ImageParseError as exc:
-        raise ClientRequestError(f"invalid image: {exc}", code="invalid_image") from exc
-
+    # Cache lookup BEFORE any download (see router.py route_chat_completions).
     run_vlm2 = len(cur_text.strip()) > 1
 
     per_image: list[dict | None] = []
-    pending: list[tuple[str, str]] = []
-    for url, data_url in zip(cur_images, data_urls):
-        key = image_utils.image_hash(url)
-        cached = _DESC_CACHE.get(key)
+    pending_urls: list[str] = []
+    for url in cur_images:
+        cache_key = _desc_cache_key(image_utils.image_hash(url), cur_text)
+        cached = _DESC_CACHE.get(cache_key)
         if cached is not None:
             per_image.append(cached)
         else:
             per_image.append(None)
-            pending.append((data_url, key))
+            pending_urls.append(url)
 
-    async def vlm_pair(data_url: str) -> tuple[str, str | None]:
-        if run_vlm2:
-            overall, focus = await asyncio.gather(
-                _vlm.describe_overall(VLM1_SYSTEM, data_url),
-                _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text),
+    if pending_urls:
+        try:
+            data_urls = await asyncio.gather(
+                *[image_utils.prepare_image(url) for url in pending_urls]
             )
-            return overall, focus
-        overall = await _vlm.describe_overall(VLM1_SYSTEM, data_url)
-        return overall, None
+        except ImageParseError as exc:
+            raise ClientRequestError(f"invalid image: {exc}", code="invalid_image") from exc
 
-    if pending:
+        async def vlm_pair(data_url: str) -> tuple[str, str | None]:
+            if run_vlm2:
+                overall, focus = await asyncio.gather(
+                    _vlm.describe_overall(VLM1_SYSTEM, data_url),
+                    _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text),
+                )
+                return overall, focus
+            overall = await _vlm.describe_overall(VLM1_SYSTEM, data_url)
+            return overall, None
+
         pair_results = await asyncio.gather(
-            *[vlm_pair(d) for d, _ in pending], return_exceptions=True
+            *[vlm_pair(d) for d in data_urls], return_exceptions=True
         )
         pi = 0
         for i, item in enumerate(per_image):
@@ -152,7 +159,13 @@ async def route_messages(body: dict):
             overall, focus = res
             cached = {"overall": overall, "focus": focus}
             per_image[i] = cached
-            _cache_desc(pending[pi - 1][1], overall, focus)
+            _cache_desc(
+                _desc_cache_key(
+                    image_utils.image_hash(pending_urls[pi - 1]), cur_text
+                ),
+                overall,
+                focus,
+            )
 
     merged = merger.merge_multi_image(per_image, cur_text)
 
@@ -186,7 +199,9 @@ async def _forward_anthropic(messages: list, params: dict, model: str, stream: b
     body_params = dict(params)
     if stream:
         try:
-            chunk_iter = _llm.stream_chunks(messages, body_params)
+            # Claude Code's /context and token accounting depend on usage in
+            # the streamed response, so force include_usage=true here.
+            chunk_iter = _llm.stream_chunks(messages, body_params, force_usage=True)
         except LLMBackendError as exc:
             _log_message_pairs(messages, exc)
             return _llm_error_response(exc)

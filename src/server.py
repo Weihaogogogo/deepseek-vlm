@@ -17,12 +17,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MAX_BODY_BYTES = 50 * 1024 * 1024
+
 app = FastAPI(
     title="fake-vlm",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
 )
+
+
+@app.middleware("http")
+async def _limit_body_size(request: Request, call_next):
+    """Reject request bodies over 50MB with a 413 before the route parses them."""
+    if request.url.path not in ("/v1/chat/completions", "/v1/messages"):
+        return await call_next(request)
+    size = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_BODY_BYTES:
+            if request.url.path == "/v1/messages":
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "request body too large (max 50MB)",
+                        },
+                    },
+                )
+            return _error(
+                413,
+                "request body too large (max 50MB)",
+                "invalid_request_error",
+                "payload_too_large",
+            )
+        chunks.append(chunk)
+    # Cache the read body so the route's request.json() does not re-read the stream.
+    request._body = b"".join(chunks)
+    return await call_next(request)
 
 
 def _error(status: int, message: str, type_: str, code: str) -> JSONResponse:

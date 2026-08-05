@@ -47,13 +47,20 @@ class DeepSeekClient:
         self.model = config.DEEPSEEK_MODEL
 
     @staticmethod
-    def _passthrough_params(body: dict, stream: bool = False) -> dict:
+    def _passthrough_params(
+        body: dict, stream: bool = False, force_usage: bool = False
+    ) -> dict:
         params = {k: v for k, v in body.items() if k in _PASSTHROUGH_PARAMS and v is not None}
-        if stream:
-            # Always request usage in streamed responses — clients (Claude
-            # Code's /context, token accounting) rely on per-response counts.
-            # NOTE: deepseek rejects stream_options on non-streaming calls.
-            so = params.get("stream_options")
+        if not stream:
+            # deepseek rejects stream_options on non-streaming calls.
+            params.pop("stream_options", None)
+            return params
+        so = params.get("stream_options")
+        if force_usage or so is None:
+            # Anthropic path (Claude Code /context, token accounting) and the
+            # default OpenAI streaming case both need per-response usage. Only
+            # an explicit stream_options.include_usage=false from the OpenAI
+            # client is respected as-is (passthrough semantics).
             if so is None:
                 params["stream_options"] = {"include_usage": True}
             elif not so.get("include_usage"):
@@ -111,12 +118,14 @@ class DeepSeekClient:
             self._raise_backend(exc)
         return resp.model_dump()
 
-    async def stream_chunks(self, messages: list, body: dict):
+    async def stream_chunks(
+        self, messages: list, body: dict, force_usage: bool = False
+    ):
         """Streaming: returns the raw OpenAI chunk async iterable (for protocol adapters).
 
         Upstream errors surface before the first chunk is yielded.
         """
-        params = self._passthrough_params(body, stream=True)
+        params = self._passthrough_params(body, stream=True, force_usage=force_usage)
         try:
             stream = await self._client.chat.completions.create(
                 model=self.model, messages=messages, stream=True, **params
@@ -128,6 +137,7 @@ class DeepSeekClient:
                 yield chunk
         except Exception as exc:
             await stream.close()
+            logger.error("stream interrupted mid-iteration: %s", exc, exc_info=True)
             self._raise_backend(exc)
         finally:
             await stream.close()
@@ -162,6 +172,9 @@ class DeepSeekClient:
                 async for chunk in iterator:
                     yield self._chunk_line(chunk, rewrite_model)
                 yield "data: [DONE]\n\n"
+            except Exception as exc:
+                logger.error("stream interrupted mid-iteration: %s", exc, exc_info=True)
+                raise
             finally:
                 await stream.close()
 

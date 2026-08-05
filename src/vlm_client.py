@@ -1,7 +1,8 @@
 """qwen3-vl-flash calls: VLM-1 overall transcription, VLM-2 focused description."""
+import asyncio
 import logging
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -12,9 +13,23 @@ VLM_TIMEOUT = 120.0
 VLM2_HEADER = "# 聚焦描述"
 VLM2_RETRY_PROMPT = "你没有按规范输出，请严格遵守系统规范，只输出聚焦描述"
 
+_MAX_CONCURRENCY = 4
+_MAX_RETRIES = 2
+_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+
+_semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
+
 
 class VisionBackendError(Exception):
     """Raised when a VLM call ultimately fails."""
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, APIConnectionError):
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code == 429 or 500 <= exc.status_code < 600
+    return False
 
 
 class VLMClient:
@@ -32,22 +47,39 @@ class VLMClient:
         return {"type": "text", "text": text}
 
     async def _complete(self, system_prompt: str, user_content: list) -> str:
-        try:
-            resp = await self._client.chat.completions.create(
-                model=VLM_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0.5,
-            )
-        except Exception as exc:
-            logger.error("VLM call failed: %s", exc)
-            raise VisionBackendError(f"vision backend error: {exc}") from exc
-        content = resp.choices[0].message.content
-        if not content or not content.strip():
-            raise VisionBackendError("vision backend returned empty content")
-        return content
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                async with _semaphore:
+                    resp = await self._client.chat.completions.create(
+                        model=VLM_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_content},
+                        ],
+                        temperature=0.5,
+                    )
+                content = resp.choices[0].message.content
+                if not content or not content.strip():
+                    raise VisionBackendError("vision backend returned empty content")
+                return content
+            except VisionBackendError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= _MAX_RETRIES or not _is_retryable(exc):
+                    break
+                logger.warning(
+                    "VLM call failed (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt + 1,
+                    _MAX_RETRIES + 1,
+                    _RETRY_BACKOFF_SECONDS[attempt],
+                    exc,
+                )
+                await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+        assert last_exc is not None
+        logger.error("VLM call failed: %s", last_exc)
+        raise VisionBackendError(f"vision backend error: {last_exc}") from last_exc
 
     async def describe_overall(self, system_prompt: str, data_url: str) -> str:
         """VLM-1: image only, no text."""
