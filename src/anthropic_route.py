@@ -23,6 +23,7 @@ from .router import (
     _cache_desc,
     _desc_cache_key,
     _ensure_reasoning_content,
+    _current_question_text,
     _extract_current_images,
     _find_cached_history_image,
     _inject_history_description,
@@ -140,12 +141,12 @@ async def route_messages(body: dict):
                 overall, focus, judgment = await asyncio.gather(
                     _vlm.describe_overall(VLM1_SYSTEM, data_url),
                     _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text),
-                    _vlm.describe_judgment(VLM3_SYSTEM, data_url, cur_text),
+                    _vlm.describe_judgment(VLM3_SYSTEM, data_url, _current_question_text(messages, last_user_idx)),
                 )
                 return overall, focus, judgment
             overall, judgment = await asyncio.gather(
                 _vlm.describe_overall(VLM1_SYSTEM, data_url),
-                _vlm.describe_judgment(VLM3_SYSTEM, data_url, cur_text),
+                _vlm.describe_judgment(VLM3_SYSTEM, data_url, _current_question_text(messages, last_user_idx)),
             )
             return overall, None, judgment
 

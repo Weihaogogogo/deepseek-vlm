@@ -212,37 +212,33 @@ class TestEnsureReasoningContent:
         out = _ensure_reasoning_content(msgs)
         assert out == msgs
 
-    def test_history_image_desc_gets_marked(self):
-        # 历史 assistant 消息的 reasoning_content 嵌入 VLM 描述（vision_prefix
-        # 拼进返回消息后的回传形态）→ 加"历史图片描述"前缀，防止 deepseek 误判
-        msgs = [{
-            "role": "assistant",
-            "content": "回答",
-            "reasoning_content": "【图片·整体】\n# 画面转录\n类型: scene",
-        }]
-        out = _ensure_reasoning_content(msgs)
-        assert out[0]["reasoning_content"].startswith(router._HISTORY_IMAGE_PREFIX)
-        assert "【图片·整体】" in out[0]["reasoning_content"]
 
-    def test_history_plain_reasoning_not_marked(self):
-        # 普通思考内容（无图片描述标签）不加前缀
-        msgs = [{
-            "role": "assistant",
-            "content": "回答",
-            "reasoning_content": "就是普通思考",
-        }]
-        out = _ensure_reasoning_content(msgs)
-        assert out[0]["reasoning_content"] == "就是普通思考"
+class TestCurrentQuestionText:
+    """_current_question_text：VLM-3 的输入只取当前问题，不扫历史。"""
 
-    def test_history_marked_only_once(self):
-        # 已标记的消息不重复加前缀（幂等）
-        msgs = [{
-            "role": "assistant",
-            "content": "回答",
-            "reasoning_content": router._HISTORY_IMAGE_PREFIX + "\n\n【图片·整体】\n内容",
-        }]
-        out = _ensure_reasoning_content(msgs)
-        assert out[0]["reasoning_content"].count(router._HISTORY_IMAGE_PREFIX) == 1
+    def test_returns_current_user_text_only(self):
+        msgs = [
+            _user("历史问题一"),
+            {"role": "assistant", "content": "历史回答"},
+            _user("当前问题"),
+        ]
+        assert router._current_question_text(msgs) == "当前问题"
+
+    def test_multimodal_current_message_text_extracted(self):
+        msgs = [
+            _user("历史问题"),
+            {"role": "assistant", "content": "历史回答"},
+            _user([_text_part("图里是谁"), _img_part("http://img/a.png")]),
+        ]
+        assert router._current_question_text(msgs) == "图里是谁"
+
+    def test_pure_image_message_returns_empty(self):
+        msgs = [_user("历史问题"), {"role": "assistant", "content": "历史回答"}, _user([_img_part("http://img/a.png")])]
+        assert router._current_question_text(msgs) == ""
+
+    def test_last_user_idx_explicit(self):
+        msgs = [_user("历史"), _user("当前")]
+        assert router._current_question_text(msgs, last_user_idx=1) == "当前"
 
 
 # ---------- _strip_message_images ----------
@@ -529,6 +525,48 @@ class TestVlmPairThreeWay:
         assert set(calls) == {"overall", "judgment"}
         assert len(router._DESC_CACHE) == 1
         assert next(iter(router._DESC_CACHE.values()))["judgment"] == "判断描述"
+
+    def test_judgment_gets_current_question_not_history(self, monkeypatch):
+        # VLM-3 的输入必须只含当前问题，不能带历史对话上下文（防止判断被
+        # 前序轮次污染）。构造：历史有 user/assistant 对话 + 当前轮带图问题。
+        judgment_questions = []
+
+        async def fake_judgment(system_prompt, data_url, question):
+            judgment_questions.append(question)
+            return "判断描述"
+
+        async def fake_overall(system_prompt, data_url):
+            return "整体描述"
+
+        async def fake_focus(system_prompt, data_url, question):
+            return "重点描述"
+
+        async def fake_prepare(url):
+            return "data:image/png;base64,AAAA"
+
+        async def fake_complete(messages, body):
+            return self._reply()
+
+        monkeypatch.setattr(router._vlm, "describe_overall", fake_overall)
+        monkeypatch.setattr(router._vlm, "describe_focus", fake_focus)
+        monkeypatch.setattr(router._vlm, "describe_judgment", fake_judgment)
+        monkeypatch.setattr(image_utils, "prepare_image", fake_prepare)
+        monkeypatch.setattr(router._llm, "complete", fake_complete)
+
+        msgs = [
+            _user("之前聊过什么"),
+            {"role": "assistant", "content": "之前回答过"},
+            _user([_text_part("这是谁"), _img_part(self.URL)]),
+        ]
+        asyncio.run(
+            router.route_chat_completions(
+                {"messages": msgs, "model": "m", "stream": False}
+            )
+        )
+        assert len(judgment_questions) == 1
+        assert judgment_questions[0] == "这是谁"
+        assert "之前聊过什么" not in judgment_questions[0]
+        assert "之前回答过" not in judgment_questions[0]
 
 
 # ---------- 旧缓存条目兼容（无 judgment） ----------
