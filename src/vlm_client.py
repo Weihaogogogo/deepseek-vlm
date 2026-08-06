@@ -9,16 +9,16 @@ logger = logging.getLogger(__name__)
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 VLM_MODEL = "qwen3.7-flash"
-# 正常调用 2-5s；dashscope 偶发 TCP 半挂起（连接不关、无数据）。30s 足够区分
-# "慢"与"死"，配合重试把单图最坏耗时压到 ~90s 内（客户端等得起）。
-VLM_TIMEOUT = 30.0
+# 正常调用 2-5s；dashscope 偶发 TCP 半挂起（连接不关、无数据）。15s 足够区分
+# "慢"与"死"，配合重试把单路最坏耗时压到 ~30s 内；网关总预算 60s 兜底。
+VLM_TIMEOUT = 15.0
 
 VLM2_HEADER = "# 聚焦描述"
 VLM2_RETRY_PROMPT = "你没有按规范输出，请严格遵守系统规范，只输出聚焦描述"
 
 _MAX_CONCURRENCY = 60
-_MAX_RETRIES = 2
-_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+_MAX_RETRIES = 1
+_RETRY_BACKOFF_SECONDS = (1.0,)
 
 _semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
 
@@ -39,7 +39,7 @@ class VLMClient:
     def __init__(self, api_key: str):
         # max_retries=0：SDK 自带连接重试与下方 _complete 的重试逻辑重复，
         # 会让单次 VLM 调用在超时场景拖到 ~90s 才失败（SDK 重试 × VLM 重试
-        # 叠加）。统一由 _complete 控制重试（30s 超时 × 2 次 = 最长 ~90s）。
+        # 叠加）。统一由 _complete 控制重试（15s 超时 × 2 次 = 最长 ~30s）。
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=DASHSCOPE_BASE_URL,

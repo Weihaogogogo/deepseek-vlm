@@ -1,4 +1,5 @@
 """FastAPI entry: auth + POST /v1/chat/completions + GET /v1/models."""
+import asyncio
 import hmac
 import logging
 
@@ -72,6 +73,43 @@ async def _limit_body_size(request: Request, call_next):
         t_done - t_header,
     )
     return resp
+
+
+# 请求总预算：故障窗口下（VLM/上游 TCP 挂起）网关也必须在 60s 内给出结果，
+# 而不是让客户端无限等待。流式响应在 call_next 返回后开始传输，不受此限制。
+REQUEST_TIMEOUT_SECONDS = 60
+
+
+@app.middleware("http")
+async def _request_timeout_guard(request: Request, call_next):
+    """Fail fast with 502 when the whole request chain exceeds the budget."""
+    if request.url.path not in ("/v1/chat/completions", "/v1/messages"):
+        return await call_next(request)
+    try:
+        return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error(
+            "request exceeded %ds budget, returning 502: %s",
+            REQUEST_TIMEOUT_SECONDS,
+            request.url.path,
+        )
+        if request.url.path == "/v1/messages":
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "gateway timeout (60s)",
+                    },
+                },
+            )
+        return _error(
+            502,
+            "gateway timeout (60s)",
+            "api_error",
+            "gateway_timeout",
+        )
 
 
 def _error(status: int, message: str, type_: str, code: str) -> JSONResponse:

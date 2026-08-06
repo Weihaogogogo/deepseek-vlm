@@ -130,17 +130,25 @@ async def route_messages(body: dict):
                 f"{_current_question_text(messages, last_user_idx)}"
             )
             if run_vlm2:
-                overall, focus, judgment = await asyncio.gather(
+                results = await asyncio.gather(
                     _vlm.describe_overall(VLM1_SYSTEM, data_url),
                     _vlm.describe_focus(VLM2_SYSTEM, data_url, focus_q),
                     _vlm.describe_judgment(VLM3_SYSTEM, data_url, judgment_q),
+                    return_exceptions=True,
                 )
-                return overall, focus, judgment
-            overall, judgment = await asyncio.gather(
+                for r in results:
+                    if isinstance(r, Exception):
+                        raise VisionUnavailable(str(r)) from r
+                return results[0], results[1], results[2]
+            results = await asyncio.gather(
                 _vlm.describe_overall(VLM1_SYSTEM, data_url),
                 _vlm.describe_judgment(VLM3_SYSTEM, data_url, judgment_q),
+                return_exceptions=True,
             )
-            return overall, None, judgment
+            for r in results:
+                if isinstance(r, Exception):
+                    raise VisionUnavailable(str(r)) from r
+            return results[0], None, results[1]
 
         pair_results = await asyncio.gather(
             *[vlm_pair(d, k + 1) for k, d in enumerate(data_urls)],

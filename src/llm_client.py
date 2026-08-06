@@ -39,10 +39,13 @@ class LLMBackendError(Exception):
 
 class DeepSeekClient:
     def __init__(self):
+        # max_retries=0：避免 SDK 重试与网关总预算叠加，失败快速上抛
+        # （60s 请求预算由 server.py 中间件兜底）。
         self._client = AsyncOpenAI(
             api_key=config.DEEPSEEK_API_KEY,
             base_url=config.DEEPSEEK_BASE_URL,
             timeout=DEEPSEEK_TIMEOUT,
+            max_retries=0,
         )
         self.model = config.DEEPSEEK_MODEL
 

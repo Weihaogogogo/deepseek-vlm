@@ -621,6 +621,69 @@ class TestVlmPairThreeWay:
         assert "看这两张" in calls["focus"][0]
 
 
+    def test_vlm_failure_three_way_raises_vision_unavailable(self, monkeypatch):
+        # 内层 gather 泄漏修复回归：三路中一路失败 → 抛 VisionUnavailable，
+        # 兄弟任务不被取消（return_exceptions 语义，不泄漏后台任务）。
+        calls = []
+
+        async def fake_overall(system_prompt, data_url):
+            calls.append("overall")
+            raise RuntimeError("dashscope down")
+
+        async def fake_focus(system_prompt, data_url, question):
+            calls.append("focus")
+            return "重点描述"
+
+        async def fake_judgment(system_prompt, data_url, question):
+            calls.append("judgment")
+            return "判断描述"
+
+        async def fake_prepare(url):
+            return "data:image/png;base64,AAAA"
+
+        monkeypatch.setattr(router._vlm, "describe_overall", fake_overall)
+        monkeypatch.setattr(router._vlm, "describe_focus", fake_focus)
+        monkeypatch.setattr(router._vlm, "describe_judgment", fake_judgment)
+        monkeypatch.setattr(image_utils, "prepare_image", fake_prepare)
+
+        msgs = [_user([_text_part("这是谁"), _img_part(self.URL)])]
+        with pytest.raises(router.VisionUnavailable):
+            asyncio.run(
+                router.route_chat_completions(
+                    {"messages": msgs, "model": "m", "stream": False}
+                )
+            )
+        assert set(calls) == {"overall", "focus", "judgment"}
+
+    def test_vlm_failure_two_way_raises_vision_unavailable(self, monkeypatch):
+        # 纯图两路分支同构：judgment 失败 → VisionUnavailable，overall 跑完。
+        calls = []
+
+        async def fake_overall(system_prompt, data_url):
+            calls.append("overall")
+            return "整体描述"
+
+        async def fake_judgment(system_prompt, data_url, question):
+            calls.append("judgment")
+            raise RuntimeError("dashscope down")
+
+        async def fake_prepare(url):
+            return "data:image/png;base64,AAAA"
+
+        monkeypatch.setattr(router._vlm, "describe_overall", fake_overall)
+        monkeypatch.setattr(router._vlm, "describe_judgment", fake_judgment)
+        monkeypatch.setattr(image_utils, "prepare_image", fake_prepare)
+
+        msgs = [_user([_img_part(self.URL)])]
+        with pytest.raises(router.VisionUnavailable):
+            asyncio.run(
+                router.route_chat_completions(
+                    {"messages": msgs, "model": "m", "stream": False}
+                )
+            )
+        assert set(calls) == {"overall", "judgment"}
+
+
 # ---------- 组装布局 ----------
 
 class TestAssemblyLayout:
