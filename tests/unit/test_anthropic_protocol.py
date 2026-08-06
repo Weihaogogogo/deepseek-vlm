@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.anthropic_protocol import (
+    _assistant_content_to_openai,
     anthropic_sse,
     parse_messages,
     parse_system,
@@ -48,12 +49,12 @@ async def _iter_chunks(chunks):
         yield c
 
 
-def _collect(chunks):
+def _collect(chunks, vision_prefix=None):
     """把 anthropic_sse 输出收集为 [(event_name, data_dict), ...]"""
 
     async def run():
         events = []
-        async for line in anthropic_sse(_iter_chunks(chunks), "deepseek-v4-flash-vl"):
+        async for line in anthropic_sse(_iter_chunks(chunks), "deepseek-v4-flash-vl", vision_prefix):
             name_line, _, data_line = line.partition("\n")
             name = name_line.split(": ", 1)[1].strip()
             events.append((name, json.loads(data_line.split(": ", 1)[1])))
@@ -163,9 +164,88 @@ class TestParseMessages:
         assert tc["function"]["name"] == "get_weather"
         assert json.loads(tc["function"]["arguments"]) == {"city": "广州"}
 
+    def test_assistant_thinking_text_becomes_reasoning_content(self):
+        # Claude Code 回传 thinking 块 → 转为 deepseek 的 reasoning_content
+        msgs = [{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "VLM 描述：图中有一只猫"},
+                {"type": "text", "text": "看到一只猫"},
+            ],
+        }]
+        out = parse_messages(msgs)
+        assert out[0]["role"] == "assistant"
+        assert out[0]["content"] == [{"type": "text", "text": "看到一只猫"}]
+        assert out[0]["reasoning_content"] == "VLM 描述：图中有一只猫"
+
+    def test_assistant_thinking_with_tool_use_keeps_reasoning_content(self):
+        msgs = [{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "需要查询天气"},
+                {"type": "tool_use", "id": "toolu_07", "name": "get_weather", "input": {"city": "北京"}},
+            ],
+        }]
+        out = parse_messages(msgs)
+        assert out[0]["role"] == "assistant"
+        assert out[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert out[0]["reasoning_content"] == "需要查询天气"
+
+    def test_assistant_multiple_thinking_blocks_joined(self):
+        msgs = [{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "第一段"},
+                {"type": "thinking", "thinking": "第二段"},
+                {"type": "text", "text": "结论"},
+            ],
+        }]
+        out = parse_messages(msgs)
+        assert out[0]["reasoning_content"] == "第一段\n\n第二段"
+
+    def test_assistant_no_thinking_block_has_no_reasoning_content(self):
+        msgs = [{"role": "assistant", "content": [{"type": "text", "text": "无思考"}]}]
+        out = parse_messages(msgs)
+        assert "reasoning_content" not in out[0]
+
     def test_unsupported_role_raises(self):
         with pytest.raises(ValueError):
             parse_messages([{"role": "robot", "content": "hi"}])
+
+
+# ---------- _assistant_content_to_openai ----------
+
+class TestAssistantContentToOpenai:
+    def test_thinking_blocks_returned_as_thinking_text(self):
+        parts, tool_calls, thinking = _assistant_content_to_openai([
+            {"type": "thinking", "thinking": "描述A"},
+            {"type": "text", "text": "正文"},
+            {"type": "thinking", "thinking": "描述B"},
+        ])
+        assert parts == [{"type": "text", "text": "正文"}]
+        assert tool_calls == []
+        assert thinking == "描述A\n\n描述B"
+
+    def test_no_thinking_blocks_returns_empty_string(self):
+        parts, tool_calls, thinking = _assistant_content_to_openai([
+            {"type": "text", "text": "正文"},
+        ])
+        assert parts == [{"type": "text", "text": "正文"}]
+        assert tool_calls == []
+        assert thinking == ""
+
+    def test_string_content_returns_empty_thinking(self):
+        parts, tool_calls, thinking = _assistant_content_to_openai("纯文本")
+        assert parts == [{"type": "text", "text": "纯文本"}]
+        assert tool_calls == []
+        assert thinking == ""
+
+    def test_empty_thinking_block_contributes_nothing(self):
+        _, _, thinking = _assistant_content_to_openai([
+            {"type": "thinking", "thinking": ""},
+            {"type": "text", "text": "正文"},
+        ])
+        assert thinking == ""
 
 
 # ---------- parse_system ----------
@@ -262,6 +342,38 @@ class TestToAnthropicMessage:
         )
         out = to_anthropic_message(resp, "m")
         assert out["content"] == [{"type": "tool_use", "id": "call_2", "name": "f", "input": {}}]
+
+    def test_vision_prefix_injects_thinking_block_first(self):
+        out = to_anthropic_message(
+            self._resp(content="你好"), "m", vision_prefix="VLM 描述"
+        )
+        assert out["content"][0] == {"type": "thinking", "thinking": "VLM 描述"}
+        assert out["content"][1] == {"type": "text", "text": "你好"}
+
+    def test_vision_prefix_with_tool_calls_keeps_thinking_first(self):
+        out = to_anthropic_message(
+            self._resp(
+                content="查一下",
+                finish_reason="tool_calls",
+                tool_calls=[{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city": "广州"}'},
+                }],
+            ),
+            "m",
+            vision_prefix="VLM 描述",
+        )
+        assert out["content"][0] == {"type": "thinking", "thinking": "VLM 描述"}
+        assert out["content"][1]["type"] == "text"
+        assert out["content"][2]["type"] == "tool_use"
+
+    def test_no_vision_prefix_has_no_thinking_block(self):
+        out = to_anthropic_message(self._resp(content="你好"), "m")
+        assert all(b["type"] != "thinking" for b in out["content"])
+
+    def test_empty_vision_prefix_has_no_thinking_block(self):
+        out = to_anthropic_message(self._resp(content="你好"), "m", vision_prefix="")
+        assert all(b["type"] != "thinking" for b in out["content"])
 
 
 # ---------- anthropic_sse ----------
@@ -392,3 +504,88 @@ class TestAnthropicSse:
             _chunk("chunk_3", finish_reason="stop"),
         ])
         assert events[-2][1]["usage"] == {"input_tokens": 100, "output_tokens": 50}
+
+    def test_vision_prefix_stream_emits_thinking_block_first(self):
+        events = _collect([
+            _chunk("chunk_1", content="你好"),
+            _chunk("chunk_2", content="，世界", finish_reason="stop", usage=_usage()),
+        ], vision_prefix="VLM 描述")
+        assert [e[0] for e in events] == [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+        # thinking 块 index 0
+        assert events[1][1]["index"] == 0
+        assert events[1][1]["content_block"] == {"type": "thinking", "thinking": ""}
+        assert events[2][1]["delta"] == {"type": "thinking_delta", "thinking": "VLM 描述"}
+        assert events[3][1]["index"] == 0
+        # 后续 text 块 index 从 1 开始
+        assert events[4][1]["index"] == 1
+        assert events[4][1]["content_block"]["type"] == "text"
+        assert events[5][1]["delta"]["text"] == "你好"
+        assert events[6][1]["delta"]["text"] == "，世界"
+        assert events[7][1]["index"] == 1
+        assert events[8][1]["delta"]["stop_reason"] == "end_turn"
+
+    def test_vision_prefix_stream_with_tool_use_indices(self):
+        events = _collect([
+            _chunk("chunk_1", tool_calls=[_tc(0, "call_0", "get_weather", '{"city": "广州"}')]),
+            _chunk("chunk_2", finish_reason="tool_calls", usage=_usage()),
+        ], vision_prefix="VLM 描述")
+        starts = [e[1] for e in events if e[0] == "content_block_start"]
+        assert [s["index"] for s in starts] == [0, 1]
+        assert [s["content_block"]["type"] for s in starts] == ["thinking", "tool_use"]
+        stops = [e[1] for e in events if e[0] == "content_block_stop"]
+        assert [s["index"] for s in stops] == [0, 1]
+        assert events[-2][1]["delta"]["stop_reason"] == "tool_use"
+
+    def test_vision_prefix_longer_than_2000_chars_sharded(self):
+        prefix = "描述" * 1200  # 2400 字符，跨 2 个分片
+        events = _collect([
+            _chunk("chunk_1", content="ok", finish_reason="stop", usage=_usage()),
+        ], vision_prefix=prefix)
+        deltas = [
+            e[1]["delta"]
+            for e in events
+            if e[0] == "content_block_delta" and e[1]["delta"]["type"] == "thinking_delta"
+        ]
+        assert len(deltas) == 2
+        assert all(len(d["thinking"]) <= 2000 for d in deltas)
+        assert "".join(d["thinking"] for d in deltas) == prefix
+        # 全部 thinking delta 的 index 都是 0
+        assert all(
+            e[1]["index"] == 0
+            for e in events
+            if e[0] == "content_block_delta" and e[1]["delta"]["type"] == "thinking_delta"
+        )
+
+    def test_no_vision_prefix_stream_has_no_thinking_events(self):
+        events = _collect([
+            _chunk("chunk_1", content="hi", finish_reason="stop", usage=_usage()),
+        ])
+        assert [e[0] for e in events] == [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+        assert not any(
+            e[1].get("content_block", {}).get("type") == "thinking"
+            for e in events if e[0] == "content_block_start"
+        )
+        assert not any(
+            e[1].get("delta", {}).get("type") == "thinking_delta"
+            for e in events if e[0] == "content_block_delta"
+        )
+        # index 仍从 0 开始（与改动前一致）
+        assert events[1][1]["index"] == 0

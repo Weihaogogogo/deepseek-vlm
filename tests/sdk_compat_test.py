@@ -46,7 +46,7 @@ print("\n=== Anthropic SDK 测试 ===")
 # 1. 非流式基础对话
 try:
     r = ac.messages.create(model=MODEL, max_tokens=200, messages=[{"role": "user", "content": "你好"}])
-    check("1 非流式对话", r.type == "message" and r.content and r.content[0].type == "text",
+    check("1 非流式对话", r.type == "message" and any(c.type == "text" for c in r.content),
           f"stop={r.stop_reason} usage={r.usage}")
 except Exception as e:
     check("1 非流式对话", False, str(e)[:200])
@@ -69,7 +69,7 @@ try:
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
         {"type": "text", "text": "图里是什么题目？"},
     ]}])
-    txt = r.content[0].text
+    txt = "".join(c.text for c in r.content if c.type == "text")
     check("3 图片输入", "长方体" in txt or "正方体" in txt or "数学" in txt or "表面积" in txt, f"'{txt[:40]}'")
 except Exception as e:
     check("3 图片输入", False, str(e)[:200])
@@ -95,7 +95,7 @@ try:
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
         ]}]},
     ])
-    txt = r.content[0].text
+    txt = "".join(c.text for c in r.content if c.type == "text")
     check("5 纯图tool_result", "数学" in txt or "长方体" in txt or "正方体" in txt, f"'{txt[:40]}'")
 except Exception as e:
     check("5 纯图tool_result", False, str(e)[:200])

@@ -54,12 +54,13 @@ def _content_to_openai(content) -> list[dict]:
     return out
 
 
-def _assistant_content_to_openai(content) -> tuple[list[dict], list[dict]]:
-    """Anthropic assistant content -> (openai content parts, tool_calls list)."""
+def _assistant_content_to_openai(content) -> tuple[list[dict], list[dict], str]:
+    """Anthropic assistant content -> (openai content parts, tool_calls list, thinking text)."""
     if isinstance(content, str):
-        return [{"type": "text", "text": content}], []
+        return [{"type": "text", "text": content}], [], ""
     parts: list[dict] = []
     tool_calls: list[dict] = []
+    thinking_parts: list[str] = []
     for block in content if isinstance(content, list) else []:
         if not isinstance(block, dict):
             continue
@@ -77,8 +78,9 @@ def _assistant_content_to_openai(content) -> tuple[list[dict], list[dict]]:
                     },
                 }
             )
-        # thinking blocks are dropped (deepseek has no use for them)
-    return parts, tool_calls
+        elif btype == "thinking":
+            thinking_parts.append(block.get("thinking", ""))
+    return parts, tool_calls, "\n\n".join(p for p in thinking_parts if p)
 
 
 def parse_messages(anthropic_msgs: list) -> list[dict]:
@@ -132,13 +134,15 @@ def parse_messages(anthropic_msgs: list) -> list[dict]:
             out.append({"role": "user", "content": _content_to_openai(content) if isinstance(content, list) else content})
         elif role == "assistant":
             if isinstance(content, list):
-                parts, tool_calls = _assistant_content_to_openai(content)
+                parts, tool_calls, thinking_text = _assistant_content_to_openai(content)
+                msg_out: dict = {"role": "assistant", "content": parts if parts else None}
                 if tool_calls:
-                    msg_out: dict = {"role": "assistant", "content": parts if parts else None}
                     msg_out["tool_calls"] = tool_calls
-                    out.append(msg_out)
                 else:
-                    out.append({"role": "assistant", "content": parts if parts else ""})
+                    msg_out["content"] = parts if parts else ""
+                if thinking_text:
+                    msg_out["reasoning_content"] = thinking_text
+                out.append(msg_out)
             else:
                 out.append({"role": "assistant", "content": content})
         elif role == "system":
@@ -215,15 +219,13 @@ def _stop_reason(finish_reason: str | None) -> str:
     )
 
 
-def to_anthropic_message(openai_resp: dict, model: str) -> dict:
+def to_anthropic_message(openai_resp: dict, model: str, vision_prefix: str | None = None) -> dict:
     """Non-streaming OpenAI chat completion dict -> Anthropic message dict."""
     choice = (openai_resp.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     content: list[dict] = []
-    # TODO(vlm-reasoning-prefix): message.reasoning_content 在此被丢弃——OpenAI
-    # 侧的 VLM 描述前缀（router._forward vision_prefix）无法注入 Anthropic
-    # 响应：thinking 块需模型开启 thinking 且带签名，客户端会拒绝伪造块。
-    # 流式 anthropic_sse 同样未处理 delta.reasoning_content。
+    if vision_prefix:
+        content.insert(0, {"type": "thinking", "thinking": vision_prefix})
     text = message.get("content")
     if text:
         content.append({"type": "text", "text": text})
@@ -271,7 +273,7 @@ def anthropic_error(status: int, message: str, etype: str | None = None) -> dict
     return {"type": "error", "error": {"type": etype, "message": message}}
 
 
-async def anthropic_sse(chunk_iter, model: str):
+async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None):
     """Translate an OpenAI chunk async iterable into Anthropic SSE events.
 
     Yields raw SSE lines ("event: ...\n...\n\n" style consumed by clients).
@@ -281,7 +283,7 @@ async def anthropic_sse(chunk_iter, model: str):
     sent_start = False
     text_index = None
     tool_indices: dict[int, int] = {}  # deepseek tc.index -> anthropic block index
-    block_counter = 0
+    block_counter = 1 if vision_prefix else 0
     usage = {"input_tokens": 0, "output_tokens": 0}
     stop_reason = None
     blocks_done = False
@@ -319,6 +321,31 @@ async def anthropic_sse(chunk_iter, model: str):
                     },
                 },
             )
+            if vision_prefix:
+                yield evt(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    },
+                )
+                for i in range(0, len(vision_prefix), 2000):
+                    yield evt(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "thinking_delta",
+                                "thinking": vision_prefix[i : i + 2000],
+                            },
+                        },
+                    )
+                yield evt(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": 0},
+                )
             sent_start = True
 
         if delta:

@@ -150,7 +150,50 @@ def _extract_current_images(messages: list) -> list[str]:
     History images (earlier turns) are intentionally ignored.
     """
     collected: list[str] = []
+    # [diag] 全序列扫描：找出所有带图片的 tool 消息及其位置，判断
+    # Claude Code Read 的图片到底在不在、在哪个位置、什么形态。
+    if messages:
+        img_tools = []
+        for idx, m in enumerate(messages):
+            if m.get("role") != "tool":
+                continue
+            c = m.get("content")
+            if isinstance(c, list):
+                types = [p.get("type") for p in c if isinstance(p, dict)]
+                has_img = any(p.get("type") == "image_url" for p in c if isinstance(p, dict))
+                if has_img:
+                    img_tools.append(f"#{idx}[list:{types}]")
+            elif isinstance(c, str):
+                if "image" in c[:120].lower() or "【图片】" in c:
+                    img_tools.append(f"#{idx}[str:{c[:50]}]")
+        tail = messages[-3:]
+        diag = []
+        for m in tail:
+            c = m.get("content")
+            if isinstance(c, list):
+                types = [p.get("type") for p in c if isinstance(p, dict)]
+                diag.append(f"{m.get('role')}[list:{types}]")
+                # [diag] user 消息里的图片 url 前缀，确认 Claude Code 发的是
+                # 什么形态（data:/file:/http:）
+                if m.get("role") == "user":
+                    for p in c:
+                        if isinstance(p, dict) and p.get("type") == "image_url":
+                            u = p.get("image_url") or {}
+                            url = u.get("url", "") if isinstance(u, dict) else ""
+                            diag.append(f"  img_url_prefix={str(url)[:80]}")
+            else:
+                diag.append(f"{m.get('role')}[str:{str(c)[:60]}]")
+        logger.info(
+            "[diag-extract] total=%d tail=%s img_tools=%s",
+            len(messages),
+            " | ".join(diag),
+            img_tools if img_tools else "无",
+        )
     for m in reversed(messages):
+        if m.get("role") == "system":
+            # Claude Code 会在消息末尾注入 system 提示（如 ToolSearch 说明），
+            # 不能因此中断扫描——跳过继续往前找 user 消息里的图片。
+            continue
         if m.get("role") != "user":
             break
         content = m.get("content")
@@ -170,12 +213,40 @@ def _extract_current_images(messages: list) -> list[str]:
             seen.add(h)
             unique.append(url)
         return unique[-_MAX_IMAGES_PER_TURN:]
-    if messages and messages[-1].get("role") == "tool" and isinstance(
-        messages[-1].get("content"), list
-    ):
-        _, imgs = _parse_content(messages[-1].get("content"))
-        if imgs:
-            return imgs[-_MAX_IMAGES_PER_TURN:]
+    # tool 图片回退：Claude Code 的 agent 循环里，Read 的 tool_result 图片
+    # 不一定正好是最后一条（后面可能跟着 assistant 回复或新的 user 消息），
+    # 但图片属于"最后一个用户请求"的 agent 执行段。从最后往前收集 tool
+    # 消息里的图片，遇到倒数第二个 user 消息（即上一个用户回合）就停。
+    for m in reversed(messages):
+        if m.get("role") == "system":
+            continue
+        if m.get("role") == "user":
+            # 最后一个 user 之后的 tool 图片已收集完；再往前就是历史回合
+            break
+        if m.get("role") == "tool" and isinstance(m.get("content"), list):
+            _, imgs = _parse_content(m.get("content"))
+            if imgs:
+                collected.extend(reversed(imgs))
+    if collected:
+        collected.reverse()  # original sending order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for url in collected:
+            h = image_utils.image_hash(url)
+            if h in seen:
+                continue
+            seen.add(h)
+            unique.append(url)
+        return unique[-_MAX_IMAGES_PER_TURN:]
+    else:
+        # [diag] 最后一段没有 tool 图片时说明原因
+        last = messages[-1] if messages else None
+        if last is not None:
+            logger.info(
+                "[diag-extract] no tool images in current segment, last role=%s type=%s",
+                last.get("role"),
+                type(last.get("content")).__name__,
+            )
     return []
 
 
@@ -257,12 +328,17 @@ def _strip_message_images(message: dict, current_image_urls: list[str] | None = 
                 if not (isinstance(part, dict) and part.get("type") == "image_url")
             ]
             if not kept:
-                # Image-only tool result: no cache exists (stateless), so write
-                # a placeholder so the backend sees content, not an empty tool
-                # message. Current-turn tool images are handled by the VLM path.
+                # Image-only tool result (history): no cache exists (stateless).
+                # Write a NEUTRAL placeholder so the backend sees content, not an
+                # empty tool message (empty -> deepseek concludes "read_file
+                # returned nothing" and the agent re-reads in a loop). The
+                # description itself lives in the assistant reasoning_content /
+                # thinking block of the same turn, so the placeholder must NOT
+                # claim the image was unparsed (that poisons the LLM's belief
+                # about what it has seen).
                 return {
                     **message,
-                    "content": "【图片】此消息包含一张图片，内容未经视觉解析",
+                    "content": "【图片】此消息包含一张图片",
                 }
             if all(isinstance(p, dict) and p.get("type") == "text" for p in kept):
                 texts = [p.get("text", "") for p in kept]

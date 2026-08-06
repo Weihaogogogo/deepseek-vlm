@@ -194,15 +194,19 @@ async def route_messages(body: dict):
     new_messages.extend(m for m in messages if m.get("role") == "system")
 
     new_messages = _ensure_reasoning_content(new_messages)
-    # TODO(vlm-reasoning-prefix): Anthropic 路径暂不注入 VLM 描述——响应转换
-    # (anthropic_protocol) 会丢弃 reasoning_content，且 Anthropic thinking 块
-    # 需模型开启 thinking 并携带签名，客户端会拒绝凭空出现的 thinking 块。
-    # OpenAI 路径（router._forward vision_prefix）已支持，此处待协议侧提供
-    # 安全的思考注入点后跟进。
-    return await _forward_anthropic(new_messages, params, model, stream)
+    vision_prefix = "\n\n".join(b["text"] for b in merged_blocks)
+    return await _forward_anthropic(
+        new_messages, params, model, stream, vision_prefix=vision_prefix
+    )
 
 
-async def _forward_anthropic(messages: list, params: dict, model: str, stream: bool):
+async def _forward_anthropic(
+    messages: list,
+    params: dict,
+    model: str,
+    stream: bool,
+    vision_prefix: str | None = None,
+):
     """Forward to deepseek and translate the response to Anthropic format."""
     messages = _normalize_tool_pairing(messages)
     body_params = dict(params)
@@ -218,7 +222,7 @@ async def _forward_anthropic(messages: list, params: dict, model: str, stream: b
         async def _stream_with_error_log():
             started = False
             try:
-                async for line in anthropic_sse(chunk_iter, model):
+                async for line in anthropic_sse(chunk_iter, model, vision_prefix):
                     started = started or "message_start" in line
                     yield line
             except LLMBackendError as exc:
@@ -243,7 +247,7 @@ async def _forward_anthropic(messages: list, params: dict, model: str, stream: b
     except LLMBackendError as exc:
         _log_message_pairs(messages, exc)
         return _llm_error_response(exc)
-    return JSONResponse(content=to_anthropic_message(data, model))
+    return JSONResponse(content=to_anthropic_message(data, model, vision_prefix))
 
 
 def _log_message_pairs(messages: list, exc: Exception) -> None:
