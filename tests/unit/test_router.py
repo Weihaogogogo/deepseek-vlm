@@ -212,6 +212,38 @@ class TestEnsureReasoningContent:
         out = _ensure_reasoning_content(msgs)
         assert out == msgs
 
+    def test_history_image_desc_gets_marked(self):
+        # 历史 assistant 消息的 reasoning_content 嵌入 VLM 描述（vision_prefix
+        # 拼进返回消息后的回传形态）→ 加"历史图片描述"前缀，防止 deepseek 误判
+        msgs = [{
+            "role": "assistant",
+            "content": "回答",
+            "reasoning_content": "【图片·整体】\n# 画面转录\n类型: scene",
+        }]
+        out = _ensure_reasoning_content(msgs)
+        assert out[0]["reasoning_content"].startswith(router._HISTORY_IMAGE_PREFIX)
+        assert "【图片·整体】" in out[0]["reasoning_content"]
+
+    def test_history_plain_reasoning_not_marked(self):
+        # 普通思考内容（无图片描述标签）不加前缀
+        msgs = [{
+            "role": "assistant",
+            "content": "回答",
+            "reasoning_content": "就是普通思考",
+        }]
+        out = _ensure_reasoning_content(msgs)
+        assert out[0]["reasoning_content"] == "就是普通思考"
+
+    def test_history_marked_only_once(self):
+        # 已标记的消息不重复加前缀（幂等）
+        msgs = [{
+            "role": "assistant",
+            "content": "回答",
+            "reasoning_content": router._HISTORY_IMAGE_PREFIX + "\n\n【图片·整体】\n内容",
+        }]
+        out = _ensure_reasoning_content(msgs)
+        assert out[0]["reasoning_content"].count(router._HISTORY_IMAGE_PREFIX) == 1
+
 
 # ---------- _strip_message_images ----------
 

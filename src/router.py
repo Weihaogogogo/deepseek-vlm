@@ -269,12 +269,28 @@ def _normalize_tool_pairing(messages: list) -> list:
     return out
 
 
+_HISTORY_IMAGE_PREFIX = (
+    "【历史图片描述｜非当前轮信息】以下内容来自之前轮次中图片的视觉描述，"
+    "仅作为对话背景参考，不代表当前消息附带图片。"
+)
+
+
 def _ensure_reasoning_content(messages: list) -> list:
     """deepseek thinking mode requires assistant tool_calls messages to carry
     reasoning_content back. Anthropic-format history has no such field, so pad
-    it with an empty string when missing (empty string is accepted)."""
+    it with an empty string when missing (empty string is accepted).
+
+    Also marks historical assistant reasoning_content that embeds VLM image
+    descriptions (vision_prefix was merged into the returned assistant message
+    on a previous image turn). Without the marker, deepseek may mistake the
+    old description for a current-turn image when the harness replays history.
+    """
     out = []
     for m in messages:
+        if m.get("role") == "assistant" and m.get("reasoning_content"):
+            rc = m["reasoning_content"]
+            if rc and not rc.startswith(_HISTORY_IMAGE_PREFIX) and _looks_like_image_desc(rc):
+                m = {**m, "reasoning_content": _HISTORY_IMAGE_PREFIX + "\n\n" + rc}
         if (
             m.get("role") == "assistant"
             and m.get("tool_calls")
@@ -284,6 +300,11 @@ def _ensure_reasoning_content(messages: list) -> list:
         else:
             out.append(m)
     return out
+
+
+def _looks_like_image_desc(text: str) -> bool:
+    """True if the reasoning text embeds a VLM image description block."""
+    return any(tag in text for tag in ("【图片·整体】", "【图片·重点】", "【图片·判断】"))
 
 
 def _strip_message_images(message: dict):

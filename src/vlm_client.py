@@ -1,4 +1,4 @@
-"""qwen3-vl-flash calls: VLM-1 overall transcription, VLM-2 focused description,
+"""qwen3.7-flash calls: VLM-1 overall transcription, VLM-2 focused description,
 VLM-3 direct judgment."""
 import asyncio
 import logging
@@ -8,7 +8,7 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-VLM_MODEL = "qwen3-vl-flash"
+VLM_MODEL = "qwen3.7-flash"
 # 正常调用 2-5s；dashscope 偶发 TCP 半挂起（连接不关、无数据）。30s 足够区分
 # "慢"与"死"，配合重试把单图最坏耗时压到 ~90s 内（客户端等得起）。
 VLM_TIMEOUT = 30.0
