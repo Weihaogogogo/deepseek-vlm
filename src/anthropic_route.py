@@ -174,13 +174,15 @@ async def route_messages(body: dict):
                 judgment,
             )
 
-    merged = merger.merge_multi_image(per_image, cur_text)
+    merged_blocks = merger.merge_multi_image(per_image)
 
     # Cache-friendly assembly: keep the SHARED prefix (system_text + history)
-    # identical across image and no-image turns, and put LLM_SYSTEM + merged
-    # description at the END as user messages. deepseek's prefix cache then
-    # hits on all history tokens on every turn (verified: any change at the
-    # start of the request invalidates the whole cache).
+    # identical across image and no-image turns, keep the current user message
+    # with [图片 N] placeholders, and put merged blocks + LLM_SYSTEM at the END
+    # as user messages. deepseek's prefix cache then hits on all history tokens
+    # on every turn (verified: any change at the start of the request
+    # invalidates the whole cache). Explicit systems stay appended at the end
+    # (existing behavior).
     new_messages: list[dict] = []
     if system_text.strip():
         new_messages.append({"role": "system", "content": system_text})
@@ -188,12 +190,15 @@ async def route_messages(body: dict):
         if message.get("role") == "system":
             continue  # explicit systems appended at the end (never in the shared prefix)
         if i == last_user_idx:
-            new_messages.append({"role": "user", "content": LLM_SYSTEM})
-            new_messages.append({"role": "user", "content": merged})
+            stripped = _strip_message_images(message, current_image_urls=cur_images)
+            if stripped:
+                new_messages.append(stripped)  # 保留原消息（问题文本 + [图片 N]）
             continue
-        stripped = _strip_message_images(message)
+        stripped = _strip_message_images(message)  # 历史：[历史图片]
         if stripped:
             new_messages.append(stripped)
+    new_messages.append({"role": "user", "content": merged_blocks})
+    new_messages.append({"role": "user", "content": LLM_SYSTEM})
     new_messages.extend(m for m in messages if m.get("role") == "system")
 
     new_messages = _ensure_reasoning_content(new_messages)

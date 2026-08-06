@@ -4,9 +4,11 @@
 - _extract_current_images：WorkBuddy 双 user 分离形态、历史轮次图片隔离、
   同轮去重、10 张截断、纯图 tool 消息回退
 - _normalize_tool_pairing：tool 消息被 user 文本隔开的重排（Claude Code 形态）
-- _strip_message_images：纯图 tool 消息回填缓存整体描述 / 占位文本（曾回填空串）
+- _strip_message_images：当前轮 [图片 N] / 历史 [历史图片] 占位符保序；
+  纯图 tool 消息回填缓存整体描述 / 占位文本（曾回填空串）
 - _desc_cache_key：同图不同问题必须不同缓存键（焦点串味修复）
 - _forward vision_prefix：VLM 描述注入 assistant reasoning_content 前缀
+- 组装布局：历史 → user(问题+[图片 N]) → user(merged 块数组) → user(LLM_SYSTEM)
 """
 import asyncio
 import json
@@ -262,16 +264,72 @@ class TestStripMessageImages:
         assert out["content"]
         assert out["content"].startswith("【图片】此消息包含一张图片")
 
-    def test_text_image_mixed_flattened_to_string(self):
+    def test_text_image_mixed_kept_with_current_placeholder(self):
+        # [text1, image, text2] → [text1, [图片 1], text2] 保序（不再压平）
+        msg = {"role": "user", "content": [
+            _text_part("看图 "), _img_part(self.URL), _text_part(" 回答"),
+        ]}
+        out = _strip_message_images(msg, current_image_urls=[self.URL])
+        assert out["content"] == [
+            _text_part("看图 "),
+            _text_part("[图片 1]"),
+            _text_part(" 回答"),
+        ]
+
+    def test_mixed_history_images_become_history_placeholder(self):
         msg = {"role": "user", "content": [
             _text_part("看图 "), _img_part(self.URL), _text_part(" 回答"),
         ]}
         out = _strip_message_images(msg)
-        assert out["content"] == "看图  回答"
+        assert out["content"] == [
+            _text_part("看图 "),
+            _text_part("[历史图片]"),
+            _text_part(" 回答"),
+        ]
 
-    def test_pure_image_user_dropped(self):
+    def test_pure_image_user_kept_with_current_placeholder(self):
+        # 纯图 user 消息不再 drop → [图片 1]
+        out = _strip_message_images(
+            {"role": "user", "content": [_img_part(self.URL)]},
+            current_image_urls=[self.URL],
+        )
+        assert out["content"] == [_text_part("[图片 1]")]
+
+    def test_pure_image_user_history_placeholder(self):
         out = _strip_message_images({"role": "user", "content": [_img_part(self.URL)]})
-        assert out is None
+        assert out["content"] == [_text_part("[历史图片]")]
+
+    def test_assistant_image_history_placeholder(self):
+        msg = {"role": "assistant", "content": [
+            _text_part("收到 "), _img_part(self.URL),
+        ]}
+        out = _strip_message_images(msg)
+        assert out["content"] == [_text_part("收到 "), _text_part("[历史图片]")]
+
+    def test_current_placeholders_numbered_by_url_index(self):
+        # N = url 在 current_image_urls 中的下标+1，与 merged 块一一对应
+        urls = ["http://img/1.png", "http://img/2.png"]
+        msg = {"role": "user", "content": [_img_part(urls[1]), _img_part(urls[0])]}
+        out = _strip_message_images(msg, current_image_urls=urls)
+        assert out["content"] == [_text_part("[图片 2]"), _text_part("[图片 1]")]
+
+    def test_current_placeholder_matches_extract_current_images_order(self):
+        # 真实流程：cur_images 来自 _extract_current_images（原始发送顺序）
+        msgs = [_user([_img_part("http://img/a.png"), _img_part("http://img/b.png")])]
+        cur = _extract_current_images(msgs)
+        out = _strip_message_images(msgs[0], current_image_urls=cur)
+        assert out["content"] == [_text_part("[图片 1]"), _text_part("[图片 2]")]
+
+    def test_url_not_in_current_list_falls_back_to_history_placeholder(self):
+        out = _strip_message_images(
+            {"role": "user", "content": [_img_part("http://img/other.png")]},
+            current_image_urls=["http://img/a.png"],
+        )
+        assert out["content"] == [_text_part("[历史图片]")]
+
+    def test_text_only_array_still_flattened(self):
+        out = _strip_message_images({"role": "user", "content": [_text_part("a"), _text_part("b")]})
+        assert out["content"] == "ab"
 
 
 # ---------- 描述缓存键 ----------
@@ -321,28 +379,22 @@ class TestParseStream:
 # ---------- merger.merge_multi_image ----------
 
 class TestMergeMultiImage:
-    def test_single_image_no_numbering(self):
-        out = merger.merge_multi_image([{"overall": "画面描述", "focus": "重点描述"}], "问题")
-        assert out == (
-            "【图片·整体】\n画面描述\n\n【图片·重点】\n重点描述\n\n【用户问题】\n问题"
-        )
+    def test_single_image_one_block(self):
+        out = merger.merge_multi_image([{"overall": "画面描述", "focus": "重点描述"}])
+        assert out == [{"type": "text", "text": "画面描述\n---\n重点描述"}]
 
-    def test_multi_image_numbered_by_sending_order(self):
+    def test_multi_image_blocks_in_sending_order(self):
         out = merger.merge_multi_image([
             {"overall": "图1描述", "focus": "图1重点"},
             {"overall": "图2描述", "focus": None},
-        ], "问题")
-        # 多图编号在标签后：【图片·整体】1（单图无编号）
-        assert "【图片·整体】1\n图1描述" in out
-        assert "【图片·重点】1\n图1重点" in out
-        assert "【图片·整体】2\n图2描述" in out
-        assert "【图片·重点】2" not in out
-        assert out.endswith("【用户问题】\n问题")
+        ])
+        assert len(out) == 2
+        assert out[0]["text"] == "图1描述\n---\n图1重点"
+        assert out[1]["text"] == "图2描述"
 
     def test_focus_none_omitted(self):
-        out = merger.merge_multi_image([{"overall": "描述", "focus": None}], "问题")
-        assert "【图片·重点】" not in out
-        assert "【用户问题】\n问题" in out
+        out = merger.merge_multi_image([{"overall": "描述", "focus": None}])
+        assert out == [{"type": "text", "text": "描述"}]
 
 
 # ---------- _forward vision_prefix ----------
@@ -502,10 +554,9 @@ class TestVlmPairThreeWay:
             )
         )
         assert set(calls) == {"overall", "focus", "judgment"}
-        # judgment 进入合并文本（vision_prefix → reasoning_content）
+        # judgment 进入合并块文本（vision_prefix → reasoning_content）
         msg = json.loads(resp.body)["choices"][0]["message"]
-        assert "【图片·判断】\n判断描述" in msg["reasoning_content"]
-        assert "【图片·整体】\n整体描述" in msg["reasoning_content"]
+        assert "整体描述\n---\n重点描述\n---\n判断描述" in msg["reasoning_content"]
         # 缓存条目含 judgment
         assert len(router._DESC_CACHE) == 1
         assert next(iter(router._DESC_CACHE.values()))["judgment"] == "判断描述"
@@ -587,8 +638,7 @@ class TestCacheBackwardCompat:
         router._DESC_CACHE[key] = {"overall": "旧整体", "focus": "旧重点"}  # 旧格式
         merged = router._find_cached_history_image(msgs, cur_text)
         assert merged is not None
-        assert "旧整体" in merged and "旧重点" in merged
-        assert "【图片·判断】" not in merged
+        assert merged == [{"type": "text", "text": "旧整体\n---\n旧重点"}]
 
     def test_history_merge_new_entry_with_judgment(self):
         msgs = [
@@ -602,7 +652,7 @@ class TestCacheBackwardCompat:
             "overall": "整体", "focus": "重点", "judgment": "迪丽热巴",
         }
         merged = router._find_cached_history_image(msgs, cur_text)
-        assert "【图片·判断】\n迪丽热巴" in merged
+        assert merged == [{"type": "text", "text": "整体\n---\n重点\n---\n迪丽热巴"}]
 
     def test_image_turn_old_entry_cache_hit_no_crash(self, monkeypatch):
         # 有图轮命中旧格式缓存：不下载不调 VLM，合并输出无判断段
@@ -632,5 +682,175 @@ class TestCacheBackwardCompat:
             )
         )
         msg = json.loads(resp.body)["choices"][0]["message"]
-        assert "旧整体" in msg["reasoning_content"]
-        assert "【图片·判断】" not in msg["reasoning_content"]
+        assert "旧整体\n---\n旧重点" in msg["reasoning_content"]
+
+
+# ---------- 组装布局 ----------
+
+class TestAssemblyLayout:
+    """组装布局：历史 → user(问题+[图片 N]) → user(merged 块数组) → user(LLM_SYSTEM)。"""
+
+    URL1 = "http://img/l1.png"
+    URL2 = "http://img/l2.png"
+
+    @staticmethod
+    def _reply():
+        return {
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "deepseek",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "回答"},
+                "finish_reason": "stop",
+            }],
+        }
+
+    def _patch_vlm_llm(self, monkeypatch, captured):
+        async def fake_overall(system_prompt, data_url):
+            return "整体描述"
+
+        async def fake_focus(system_prompt, data_url, question):
+            return "重点描述"
+
+        async def fake_judgment(system_prompt, data_url, question):
+            return "判断描述"
+
+        async def fake_prepare(url):
+            return "data:image/png;base64,AAAA"
+
+        async def fake_complete(messages, body):
+            captured.append(messages)
+            return self._reply()
+
+        monkeypatch.setattr(router._vlm, "describe_overall", fake_overall)
+        monkeypatch.setattr(router._vlm, "describe_focus", fake_focus)
+        monkeypatch.setattr(router._vlm, "describe_judgment", fake_judgment)
+        monkeypatch.setattr(image_utils, "prepare_image", fake_prepare)
+        monkeypatch.setattr(router._llm, "complete", fake_complete)
+
+    def test_image_turn_layout(self, monkeypatch):
+        # [text1, image, text2] + 当前轮问题 → 保留原消息 + [图片 N]
+        captured = []
+        self._patch_vlm_llm(monkeypatch, captured)
+        msgs = [
+            _user("历史问题"),
+            {"role": "assistant", "content": "历史回答"},
+            _user([
+                _text_part("图里是什么 "),
+                _img_part(self.URL1),
+                _text_part(" ？"),
+                _img_part(self.URL2),
+            ]),
+        ]
+        asyncio.run(
+            router.route_chat_completions(
+                {"messages": msgs, "model": "m", "stream": False}
+            )
+        )
+        out = captured[0]
+        # 历史消息原样保留（无图）
+        assert out[0] == msgs[0]
+        assert out[1] == msgs[1]
+        # 当前轮 user：问题文本 + [图片 N] 占位符，保序
+        assert out[2]["role"] == "user"
+        assert out[2]["content"] == [
+            _text_part("图里是什么 "),
+            _text_part("[图片 1]"),
+            _text_part(" ？"),
+            _text_part("[图片 2]"),
+        ]
+        # merged 块数组：2 块（数组下标 ↔ 图片编号），块内 --- 分隔三段
+        assert out[3]["role"] == "user"
+        assert out[3]["content"] == [
+            {"type": "text", "text": "整体描述\n---\n重点描述\n---\n判断描述"},
+            {"type": "text", "text": "整体描述\n---\n重点描述\n---\n判断描述"},
+        ]
+        # LLM_SYSTEM 最后
+        assert out[4]["role"] == "user"
+        assert out[4]["content"] == router.LLM_SYSTEM
+        assert len(out) == 5
+
+    def test_history_image_becomes_history_placeholder(self, monkeypatch):
+        # 历史轮次 user 图片 → [历史图片]；当前轮 → [图片 1]
+        captured = []
+        self._patch_vlm_llm(monkeypatch, captured)
+        msgs = [
+            _user([_text_part("看图 "), _img_part("http://img/hist.png")]),
+            {"role": "assistant", "content": "历史回答"},
+            _user([_text_part("新问题"), _img_part(self.URL1)]),
+        ]
+        asyncio.run(
+            router.route_chat_completions(
+                {"messages": msgs, "model": "m", "stream": False}
+            )
+        )
+        out = captured[0]
+        assert out[0]["content"] == [_text_part("看图 "), _text_part("[历史图片]")]
+        assert out[2]["content"] == [_text_part("新问题"), _text_part("[图片 1]")]
+        assert out[3]["content"] == [
+            {"type": "text", "text": "整体描述\n---\n重点描述\n---\n判断描述"}
+        ]
+        assert out[4]["content"] == router.LLM_SYSTEM
+
+
+class TestInjectHistoryDescription:
+    """无图轮注入布局：历史 → user(问题) → user(merged 块) → user(LLM_SYSTEM)。"""
+
+    def test_blocks_inserted_after_last_user(self):
+        stripped = [
+            {"role": "user", "content": "历史问题"},
+            {"role": "assistant", "content": "历史回答"},
+            {"role": "user", "content": "当前问题"},
+        ]
+        blocks = [{"type": "text", "text": "整体\n---\n重点"}]
+        out = router._inject_history_description(stripped, blocks)
+        assert out[:3] == stripped
+        assert out[3] == {"role": "user", "content": blocks}
+        assert out[4] == {"role": "user", "content": router.LLM_SYSTEM}
+        assert len(out) == 5
+
+    def test_no_image_turn_cached_history_layout(self, monkeypatch):
+        # 完整无图轮流程：历史图占位 + 注入块插在当前问题之后、LLM_SYSTEM 最后
+        captured = []
+
+        async def fake_complete(messages, body):
+            captured.append(messages)
+            return {
+                "id": "chatcmpl_1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "deepseek",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "回答"},
+                    "finish_reason": "stop",
+                }],
+            }
+
+        monkeypatch.setattr(router._llm, "complete", fake_complete)
+        msgs = [
+            _user([_img_part("http://img/hist.png")]),
+            {"role": "assistant", "content": "看过了"},
+            _user("那张图里是谁？"),
+        ]
+        cur_text = router._pick_focus_text(msgs)
+        key = _desc_cache_key(image_utils.image_hash("http://img/hist.png"), cur_text)
+        router._DESC_CACHE[key] = {
+            "overall": "整体", "focus": "重点", "judgment": "迪丽热巴",
+        }
+        asyncio.run(
+            router.route_chat_completions(
+                {"messages": msgs, "model": "m", "stream": False}
+            )
+        )
+        out = captured[0]
+        assert out[0]["content"] == [_text_part("[历史图片]")]
+        assert out[1] == msgs[1]
+        assert out[2] == msgs[2]  # 当前问题保留原样
+        assert out[3]["content"] == [
+            {"type": "text", "text": "整体\n---\n重点\n---\n迪丽热巴"}
+        ]
+        assert out[4]["content"] == router.LLM_SYSTEM
+        assert len(out) == 5

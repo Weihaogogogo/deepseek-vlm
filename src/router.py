@@ -115,8 +115,8 @@ def _cache_desc(
         _DESC_CACHE.popitem(last=False)
 
 
-def _find_cached_history_image(messages: list, question: str) -> str | None:
-    """Merged description (overall + focus + current question) of the MOST
+def _find_cached_history_image(messages: list, question: str) -> list[dict] | None:
+    """Merged description blocks (overall + focus + judgment) of the MOST
     RECENT history image, if its VLM output was cached."""
     for m in reversed(messages):
         if m.get("role") not in ("user", "tool"):
@@ -130,29 +130,24 @@ def _find_cached_history_image(messages: list, question: str) -> str | None:
         for url in reversed(imgs):
             key = _desc_cache_key(image_utils.image_hash(url), question)
             if key in _DESC_CACHE:
-                cached = _DESC_CACHE[key]
-                return merger.merge_image_info(
-                    cached.get("overall", ""),
-                    cached.get("focus"),
-                    question,
-                    cached.get("judgment"),
-                )
+                return merger.merge_multi_image([_DESC_CACHE[key]])
         return None  # has images but none cached; stop at the newest one
     return None
 
 
-def _inject_history_description(stripped: list, merged: str) -> list:
-    """Insert LLM_SYSTEM + cached description right BEFORE the last user
-    message, mirroring the image-turn layout so the shared prefix stays
-    identical (deepseek prefix cache) and the model gets vision context."""
+def _inject_history_description(stripped: list, merged_blocks: list[dict]) -> list:
+    """Insert cached description + LLM_SYSTEM right AFTER the last user
+    message, mirroring the image-turn layout (history -> user question ->
+    merged blocks -> LLM_SYSTEM) so the shared prefix stays identical
+    (deepseek prefix cache) and the model gets vision context."""
     out = list(stripped)
     insert_pos = len(out)
     for i in range(len(out) - 1, -1, -1):
         if out[i].get("role") == "user":
-            insert_pos = i
+            insert_pos = i + 1
             break
-    out.insert(insert_pos, {"role": "user", "content": LLM_SYSTEM})
-    out.insert(insert_pos + 1, {"role": "user", "content": merged})
+    out.insert(insert_pos, {"role": "user", "content": merged_blocks})
+    out.insert(insert_pos + 1, {"role": "user", "content": LLM_SYSTEM})
     return out
 
 
@@ -304,16 +299,21 @@ def _ensure_reasoning_content(messages: list) -> list:
     return out
 
 
-def _strip_message_images(message: dict):
-    """Returns the message with image parts removed, or None if it becomes empty.
+def _strip_message_images(message: dict, current_image_urls: list[str] | None = None):
+    """Returns the message with image parts replaced by placeholders, or None
+    if it becomes empty.
 
-    Text-only arrays are flattened to plain strings (deepseek's compatibility
-    layer rejects array content on tool/assistant messages).
+    - user/assistant history images -> "[历史图片]" text parts (order kept)
+    - current-turn user images -> "[图片 N]" text parts (N = index in
+      current_image_urls + 1, matching the merged block order)
+    - pure-image user messages are kept (placeholder text is non-empty)
+    - text-only arrays are flattened to plain strings (deepseek's
+      compatibility layer rejects array content on tool/assistant messages)
 
-    Tool messages whose content was ONLY an image get the cached VLM
-    description written in as their text — otherwise deepseek sees an empty
-    tool result and concludes "read_file returned nothing" (observed from
-    Claude Code reading PNGs: its tool_result is a bare image block).
+    Tool messages keep the existing backfill logic: image parts are dropped,
+    and an image-only tool result gets the cached VLM overall description or
+    a placeholder written in as its text — that is the agent read-image
+    scenario, not part of the placeholder system.
     """
     content = message.get("content")
     if content is None:
@@ -321,20 +321,20 @@ def _strip_message_images(message: dict):
     if isinstance(content, str):
         return message
     if isinstance(content, list):
-        img_keys = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "image_url":
-                url = part.get("image_url")
-                u = url.get("url") if isinstance(url, dict) else None
-                if isinstance(u, str) and u:
-                    img_keys.append(image_utils.image_hash(u))
-        kept = [
-            part
-            for part in content
-            if not (isinstance(part, dict) and part.get("type") == "image_url")
-        ]
-        if not kept:
-            if message.get("role") == "tool":
+        if message.get("role") == "tool":
+            img_keys = []
+            kept = [
+                part
+                for part in content
+                if not (isinstance(part, dict) and part.get("type") == "image_url")
+            ]
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    url = part.get("image_url")
+                    u = url.get("url") if isinstance(url, dict) else None
+                    if isinstance(u, str) and u:
+                        img_keys.append(image_utils.image_hash(u))
+            if not kept:
                 # Image-only tool result: fill with the cached overall
                 # description (no question is available for a focus lookup) so
                 # the backend sees content, not an empty tool message.
@@ -346,15 +346,34 @@ def _strip_message_images(message: dict):
                     **message,
                     "content": "【图片】此消息包含一张图片，内容未经视觉解析（缓存未命中）",
                 }
-            logger.warning(
-                "dropping history message (role=%s) whose content was only an image",
-                message.get("role"),
-            )
+            if all(isinstance(p, dict) and p.get("type") == "text" for p in kept):
+                texts = [p.get("text", "") for p in kept]
+                return {**message, "content": "".join(texts)}
+            return {**message, "content": kept}
+        had_image = False
+        replaced = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url = part.get("image_url")
+                u = url.get("url") if isinstance(url, dict) else None
+                if isinstance(u, str) and u:
+                    had_image = True
+                    if current_image_urls is not None and u in current_image_urls:
+                        n = current_image_urls.index(u) + 1
+                        replaced.append({"type": "text", "text": f"[图片 {n}]"})
+                    else:
+                        replaced.append({"type": "text", "text": "[历史图片]"})
+                continue
+            replaced.append(part)
+        if not replaced:
             return None
-        if all(isinstance(p, dict) and p.get("type") == "text" for p in kept):
-            texts = [p.get("text", "") for p in kept]
+        if (
+            not had_image
+            and all(isinstance(p, dict) and p.get("type") == "text" for p in replaced)
+        ):
+            texts = [p.get("text", "") for p in replaced]
             return {**message, "content": "".join(texts)}
-        return {**message, "content": kept}
+        return {**message, "content": replaced}
     return message
 
 
@@ -600,23 +619,29 @@ async def route_chat_completions(body: dict):
                 judgment,
             )
 
-    merged = merger.merge_multi_image(per_image, cur_text)
+    merged_blocks = merger.merge_multi_image(per_image)
 
     # Cache-friendly assembly: keep the shared prefix (system messages +
-    # history) identical across image and no-image turns; LLM_SYSTEM goes at
-    # the END as a user message so deepseek's prefix cache hits on history.
+    # history) identical across image and no-image turns; the current user
+    # message stays with [图片 N] placeholders, then merged blocks, then
+    # LLM_SYSTEM at the END as a user message so deepseek's prefix cache hits
+    # on history.
     new_messages: list[dict] = []
     for i, message in enumerate(messages):
         if i == last_user_idx:
-            new_messages.append({"role": "user", "content": LLM_SYSTEM})
-            new_messages.append({"role": "user", "content": merged})
+            stripped = _strip_message_images(message, current_image_urls=cur_images)
+            if stripped:
+                new_messages.append(stripped)  # 保留原消息（问题文本 + [图片 N]）
             continue
         if message.get("role") == "system":
             new_messages.append(message)
             continue
-        stripped = _strip_message_images(message)
+        stripped = _strip_message_images(message)  # 历史：[历史图片]
         if stripped:
             new_messages.append(stripped)
+    new_messages.append({"role": "user", "content": merged_blocks})
+    new_messages.append({"role": "user", "content": LLM_SYSTEM})
 
     new_messages = _ensure_reasoning_content(new_messages)
-    return await _forward(new_messages, body, model, stream, vision_prefix=merged)
+    vision_prefix = "\n\n".join(b["text"] for b in merged_blocks)
+    return await _forward(new_messages, body, model, stream, vision_prefix=vision_prefix)
