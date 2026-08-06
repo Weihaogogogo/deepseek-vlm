@@ -37,8 +37,14 @@ def _is_retryable(exc: Exception) -> bool:
 
 class VLMClient:
     def __init__(self, api_key: str):
+        # max_retries=0：SDK 自带连接重试与下方 _complete 的重试逻辑重复，
+        # 会让单次 VLM 调用在超时场景拖到 ~90s 才失败（SDK 重试 × VLM 重试
+        # 叠加）。统一由 _complete 控制重试（30s 超时 × 2 次 = 最长 ~90s）。
         self._client = AsyncOpenAI(
-            api_key=api_key, base_url=DASHSCOPE_BASE_URL, timeout=VLM_TIMEOUT
+            api_key=api_key,
+            base_url=DASHSCOPE_BASE_URL,
+            timeout=VLM_TIMEOUT,
+            max_retries=0,
         )
 
     @staticmethod
