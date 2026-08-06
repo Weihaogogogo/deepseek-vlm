@@ -6,7 +6,11 @@
 - _normalize_tool_pairing：tool 消息被 user 文本隔开的重排（Claude Code 形态）
 - _strip_message_images：纯图 tool 消息回填缓存整体描述 / 占位文本（曾回填空串）
 - _desc_cache_key：同图不同问题必须不同缓存键（焦点串味修复）
+- _forward vision_prefix：VLM 描述注入 assistant reasoning_content 前缀
 """
+import asyncio
+import json
+
 import pytest
 
 from src import image_utils, merger, router
@@ -311,3 +315,104 @@ class TestMergeMultiImage:
         out = merger.merge_multi_image([{"overall": "描述", "focus": None}], "问题")
         assert "【图片·重点】" not in out
         assert "【用户问题】\n问题" in out
+
+
+# ---------- _forward vision_prefix ----------
+
+class TestForwardVisionPrefix:
+    """_forward 的 vision_prefix 注入（monkeypatch _llm，无网络）。"""
+
+    MSGS = [_user("看图回答")]
+    MODEL = "deepseek-v4-flash-vl"
+
+    @staticmethod
+    def _reply(content="回答正文", reasoning=None):
+        message = {"role": "assistant", "content": content}
+        if reasoning is not None:
+            message["reasoning_content"] = reasoning
+        return {
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "deepseek",
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        }
+
+    def _patch_complete(self, monkeypatch, data):
+        async def fake_complete(messages, body):
+            return data
+
+        monkeypatch.setattr(router._llm, "complete", fake_complete)
+
+    def test_non_streaming_reasoning_content_prefixed_content_unchanged(self, monkeypatch):
+        # 有图轮：message.reasoning_content 以 vision_prefix 开头（无旧值时
+        # 等于前缀），content 回答正文不变
+        self._patch_complete(monkeypatch, self._reply())
+        resp = asyncio.run(
+            router._forward(self.MSGS, {}, self.MODEL, False, vision_prefix="VLM描述")
+        )
+        msg = json.loads(resp.body)["choices"][0]["message"]
+        assert msg["reasoning_content"] == "VLM描述"
+        assert msg["content"] == "回答正文"
+
+    def test_non_streaming_existing_reasoning_concatenated(self, monkeypatch):
+        # deepseek thinking 模式已有 reasoning_content：VLM 描述在前，
+        # 旧思考内容接在后面（\n\n 分隔）
+        self._patch_complete(monkeypatch, self._reply(reasoning="deepseek思考"))
+        resp = asyncio.run(
+            router._forward(self.MSGS, {}, self.MODEL, False, vision_prefix="VLM描述")
+        )
+        msg = json.loads(resp.body)["choices"][0]["message"]
+        assert msg["reasoning_content"] == "VLM描述\n\ndeepseek思考"
+        assert msg["content"] == "回答正文"
+
+    def test_non_streaming_without_prefix_unchanged(self, monkeypatch):
+        # 无图轮：vision_prefix 为 None，response 原样透传
+        self._patch_complete(monkeypatch, self._reply(reasoning="deepseek思考"))
+        resp = asyncio.run(router._forward(self.MSGS, {}, self.MODEL, False))
+        msg = json.loads(resp.body)["choices"][0]["message"]
+        assert msg["reasoning_content"] == "deepseek思考"
+        assert msg["content"] == "回答正文"
+
+    def test_streaming_first_chunk_is_vision_prefix(self, monkeypatch):
+        # 有图轮流式：首个 SSE chunk 的 delta 只有 reasoning_content ==
+        # vision_prefix（无 content），其后才透传 deepseek 的流
+        async def fake_stream(messages, body, model):
+            async def gen():
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "id": "chatcmpl_ds",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "你好"},
+                            "finish_reason": None,
+                        }],
+                    })
+                    + "\n\n"
+                )
+                yield "data: [DONE]\n\n"
+
+            return gen()
+
+        monkeypatch.setattr(router._llm, "stream", fake_stream)
+        resp = asyncio.run(
+            router._forward(self.MSGS, {}, self.MODEL, True, vision_prefix="VLM描述")
+        )
+
+        async def collect():
+            return [line async for line in resp.body_iterator]
+
+        lines = asyncio.run(collect())
+        first = json.loads(lines[0][len("data: "):].strip())
+        assert first["choices"][0]["delta"]["reasoning_content"] == "VLM描述"
+        assert first["choices"][0]["delta"].get("content") is None
+        assert first["choices"][0]["finish_reason"] is None
+        assert first["model"] == self.MODEL
+        # deepseek 原始 chunk 原样透传
+        second = json.loads(lines[1][len("data: "):].strip())
+        assert second["choices"][0]["delta"]["content"] == "你好"
+        assert lines[-1] == "data: [DONE]\n\n"

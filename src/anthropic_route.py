@@ -190,6 +190,11 @@ async def route_messages(body: dict):
     new_messages.extend(m for m in messages if m.get("role") == "system")
 
     new_messages = _ensure_reasoning_content(new_messages)
+    # TODO(vlm-reasoning-prefix): Anthropic 路径暂不注入 VLM 描述——响应转换
+    # (anthropic_protocol) 会丢弃 reasoning_content，且 Anthropic thinking 块
+    # 需模型开启 thinking 并携带签名，客户端会拒绝凭空出现的 thinking 块。
+    # OpenAI 路径（router._forward vision_prefix）已支持，此处待协议侧提供
+    # 安全的思考注入点后跟进。
     return await _forward_anthropic(new_messages, params, model, stream)
 
 

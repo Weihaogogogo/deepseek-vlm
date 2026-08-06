@@ -220,6 +220,10 @@ def to_anthropic_message(openai_resp: dict, model: str) -> dict:
     choice = (openai_resp.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     content: list[dict] = []
+    # TODO(vlm-reasoning-prefix): message.reasoning_content 在此被丢弃——OpenAI
+    # 侧的 VLM 描述前缀（router._forward vision_prefix）无法注入 Anthropic
+    # 响应：thinking 块需模型开启 thinking 且带签名，客户端会拒绝伪造块。
+    # 流式 anthropic_sse 同样未处理 delta.reasoning_content。
     text = message.get("content")
     if text:
         content.append({"type": "text", "text": text})

@@ -1,7 +1,10 @@
 """Routing: no-image passthrough to deepseek; image requests go through dual VLM + merge."""
 import asyncio
 import hashlib
+import json
 import logging
+import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -356,15 +359,53 @@ def _validate_messages(messages: list) -> None:
                 ) from exc
 
 
-async def _forward(messages: list, body: dict, model: str, stream: bool):
+async def _forward(
+    messages: list,
+    body: dict,
+    model: str,
+    stream: bool,
+    vision_prefix: str | None = None,
+):
     messages = _normalize_tool_pairing(messages)
     if stream:
         gen = await _llm.stream(messages, body, model)
+        if vision_prefix:
+            # VLM 描述先进 reasoning_content：客户端把它当思考内容，
+            # 描述由此进入 harness 上下文成为跨轮资产（界面不直接展示）。
+            async def gen_with_prefix(upstream=gen):
+                prefix_chunk = {
+                    "id": "chatcmpl-" + uuid.uuid4().hex[:16],
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "reasoning_content": vision_prefix,
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield "data: " + json.dumps(prefix_chunk, ensure_ascii=False) + "\n\n"
+                async for line in upstream:
+                    yield line
+
+            gen = gen_with_prefix()
         return StreamingResponse(gen, media_type="text/event-stream")
     data = await _llm.complete(messages, body)
     # Keep the model field consistent with what the client requested (streaming
     # chunks already rewrite it; non-streaming must match).
     data["model"] = model
+    if vision_prefix:
+        msg = data.get("choices", [{}])[0].get("message", {})
+        if msg:
+            old = msg.get("reasoning_content") or ""
+            msg["reasoning_content"] = (
+                vision_prefix + "\n\n" + old if old else vision_prefix
+            )
     return JSONResponse(content=data)
 
 
@@ -549,4 +590,4 @@ async def route_chat_completions(body: dict):
             new_messages.append(stripped)
 
     new_messages = _ensure_reasoning_content(new_messages)
-    return await _forward(new_messages, body, model, stream)
+    return await _forward(new_messages, body, model, stream, vision_prefix=merged)
