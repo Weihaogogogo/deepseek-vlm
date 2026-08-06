@@ -9,16 +9,17 @@ logger = logging.getLogger(__name__)
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 VLM_MODEL = "qwen3.7-flash"
-# 正常调用 2-5s；dashscope 偶发 TCP 半挂起（连接不关、无数据）。15s 足够区分
-# "慢"与"死"，配合重试把单路最坏耗时压到 ~30s 内；网关总预算 60s 兜底。
-VLM_TIMEOUT = 15.0
+# 不设 max_tokens（生硬截断会掐断描述），VLM 完整输出需要 20-35s。
+# 超时放宽到 60s，让慢但正常的调用完成；重试去掉（60s 已足够区分
+# 慢/死，重试会让单路最坏 120s，撞网关总预算被误杀）。
+VLM_TIMEOUT = 60.0
 
-VLM2_HEADER = "# 聚焦描述"
+VLM2_HEADER = "# 重点细节"
 VLM2_RETRY_PROMPT = "你没有按规范输出，请严格遵守系统规范，只输出聚焦描述"
 
 _MAX_CONCURRENCY = 60
-_MAX_RETRIES = 1
-_RETRY_BACKOFF_SECONDS = (1.0,)
+_MAX_RETRIES = 0
+_RETRY_BACKOFF_SECONDS = ()
 
 _semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
 

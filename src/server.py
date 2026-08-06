@@ -75,9 +75,10 @@ async def _limit_body_size(request: Request, call_next):
     return resp
 
 
-# 请求总预算：故障窗口下（VLM/上游 TCP 挂起）网关也必须在 60s 内给出结果，
-# 而不是让客户端无限等待。流式响应在 call_next 返回后开始传输，不受此限制。
-REQUEST_TIMEOUT_SECONDS = 60
+# 请求总预算：上游（DashScope/deepseek）故障时网关必须快速失败，而不是让
+# 客户端无限等待。必须大于 VLM_TIMEOUT(60s) + deepseek 调用时间，否则正常
+# 请求（VLM 慢但成功）会被误杀。90s 给完整链路留余量，故障时仍兜底。
+REQUEST_TIMEOUT_SECONDS = 90
 
 
 @app.middleware("http")
