@@ -1,11 +1,9 @@
 """Routing: no-image passthrough to deepseek; image requests go through dual VLM + merge."""
 import asyncio
-import hashlib
 import json
 import logging
 import time
 import uuid
-from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -79,76 +77,7 @@ def _parse_content(content) -> tuple[str, list[str]]:
 
 
 FOCUS_BUDGET_CHARS = 1000
-
-# VLM 描述缓存：'图片hash|问题指纹' -> {"overall": VLM-1输出, "focus": VLM-2输出}。
-# 有图轮存，无图轮查（历史图片跨轮保留视觉信息，agent 工具读图场景必需）。
-# 键含问题指纹：VLM-2 的 focus 是问题驱动的，同一张图不同问题必须命中不同条目。
-_DESC_CACHE: "OrderedDict[str, dict]" = OrderedDict()
-_DESC_CACHE_MAX = 200
 _MAX_IMAGES_PER_TURN = 10
-
-
-def _focus_fingerprint(question: str) -> str:
-    return hashlib.sha256(question.encode("utf-8")).hexdigest()[:8]
-
-
-def _desc_cache_key(image_key: str, question: str) -> str:
-    return f"{image_key}|{_focus_fingerprint(question)}"
-
-
-def _find_cached_overall(image_key: str) -> str | None:
-    """Overall description of the most recently cached entry for an image,
-    regardless of question (used by tool-result backfill, which has no text)."""
-    prefix = f"{image_key}|"
-    for k in reversed(_DESC_CACHE):
-        if k.startswith(prefix):
-            return _DESC_CACHE[k].get("overall") or None
-    return None
-
-
-def _cache_desc(
-    key: str, overall: str, focus: str | None, judgment: str | None = None
-) -> None:
-    _DESC_CACHE[key] = {"overall": overall, "focus": focus, "judgment": judgment}
-    _DESC_CACHE.move_to_end(key)
-    while len(_DESC_CACHE) > _DESC_CACHE_MAX:
-        _DESC_CACHE.popitem(last=False)
-
-
-def _find_cached_history_image(messages: list, question: str) -> list[dict] | None:
-    """Merged description blocks (overall + focus + judgment) of the MOST
-    RECENT history image, if its VLM output was cached."""
-    for m in reversed(messages):
-        if m.get("role") not in ("user", "tool"):
-            continue
-        content = m.get("content")
-        if content is None:
-            continue
-        _, imgs = _parse_content(content)
-        if not imgs:
-            continue
-        for url in reversed(imgs):
-            key = _desc_cache_key(image_utils.image_hash(url), question)
-            if key in _DESC_CACHE:
-                return merger.merge_multi_image([_DESC_CACHE[key]])
-        return None  # has images but none cached; stop at the newest one
-    return None
-
-
-def _inject_history_description(stripped: list, merged_blocks: list[dict]) -> list:
-    """Insert cached description + LLM_SYSTEM right AFTER the last user
-    message, mirroring the image-turn layout (history -> user question ->
-    merged blocks -> LLM_SYSTEM) so the shared prefix stays identical
-    (deepseek prefix cache) and the model gets vision context."""
-    out = list(stripped)
-    insert_pos = len(out)
-    for i in range(len(out) - 1, -1, -1):
-        if out[i].get("role") == "user":
-            insert_pos = i + 1
-            break
-    out.insert(insert_pos, {"role": "user", "content": merged_blocks})
-    out.insert(insert_pos + 1, {"role": "user", "content": LLM_SYSTEM})
-    return out
 
 
 def _pick_focus_text(messages: list) -> str:
@@ -322,29 +251,18 @@ def _strip_message_images(message: dict, current_image_urls: list[str] | None = 
         return message
     if isinstance(content, list):
         if message.get("role") == "tool":
-            img_keys = []
             kept = [
                 part
                 for part in content
                 if not (isinstance(part, dict) and part.get("type") == "image_url")
             ]
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    url = part.get("image_url")
-                    u = url.get("url") if isinstance(url, dict) else None
-                    if isinstance(u, str) and u:
-                        img_keys.append(image_utils.image_hash(u))
             if not kept:
-                # Image-only tool result: fill with the cached overall
-                # description (no question is available for a focus lookup) so
-                # the backend sees content, not an empty tool message.
-                for key in img_keys:
-                    overall = _find_cached_overall(key)
-                    if overall:
-                        return {**message, "content": overall}
+                # Image-only tool result: no cache exists (stateless), so write
+                # a placeholder so the backend sees content, not an empty tool
+                # message. Current-turn tool images are handled by the VLM path.
                 return {
                     **message,
-                    "content": "【图片】此消息包含一张图片，内容未经视觉解析（缓存未命中）",
+                    "content": "【图片】此消息包含一张图片，内容未经视觉解析",
                 }
             if all(isinstance(p, dict) and p.get("type") == "text" for p in kept):
                 texts = [p.get("text", "") for p in kept]
@@ -548,28 +466,15 @@ async def route_chat_completions(body: dict):
             s = _strip_message_images(message)
             if s is not None:
                 stripped.append(s)
-        cached = _find_cached_history_image(messages, cur_text)
-        if cached is not None:
-            stripped = _inject_history_description(stripped, cached)
-            logger.info("history image description injected (len=%d)", len(cached))
         stripped = _ensure_reasoning_content(stripped)
         return await _forward(stripped, body, model, stream)
 
-    # Cache lookup BEFORE any download: per-image key needs only the URL
-    # (data URLs hash their raw bytes, http URLs hash the url string), so
-    # cache hits skip download + compression + VLM entirely.
     run_vlm2 = len(cur_text.strip()) > 1
 
     per_image: list[dict | None] = []
-    pending_urls: list[str] = []  # urls that missed the cache and need download
     for url in cur_images:
-        cache_key = _desc_cache_key(image_utils.image_hash(url), cur_text)
-        cached = _DESC_CACHE.get(cache_key)
-        if cached is not None:
-            per_image.append(cached)
-        else:
-            per_image.append(None)
-            pending_urls.append(url)
+        per_image.append(None)
+    pending_urls = list(cur_images)
 
     if pending_urls:
         try:
@@ -581,22 +486,31 @@ async def route_chat_completions(body: dict):
                 f"invalid image url: {exc}", code="invalid_image_url"
             ) from exc
 
-        async def vlm_pair(data_url: str) -> tuple[str, str | None, str | None]:
+        async def vlm_pair(data_url: str, k: int) -> tuple[str, str | None, str | None]:
+            # 告知 VLM 本轮图片总数与当前序号：防止它看到问题文本提到其他图
+            # 就误报"缺失"（每张图独立调用，VLM 只能看到自己这一张）。
+            total = len(cur_images)
+            focus_q = f"本轮共 {total} 张图，你正在看第 {k} 张（仅此一张）。用户问题：{cur_text}"
+            judgment_q = (
+                f"本轮共 {total} 张图，你正在看第 {k} 张（仅此一张）。用户问题："
+                f"{_current_question_text(messages, last_user_idx)}"
+            )
             if run_vlm2:
                 overall, focus, judgment = await asyncio.gather(
                     _vlm.describe_overall(VLM1_SYSTEM, data_url),
-                    _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text),
-                    _vlm.describe_judgment(VLM3_SYSTEM, data_url, _current_question_text(messages, last_user_idx)),
+                    _vlm.describe_focus(VLM2_SYSTEM, data_url, focus_q),
+                    _vlm.describe_judgment(VLM3_SYSTEM, data_url, judgment_q),
                 )
                 return overall, focus, judgment
             overall, judgment = await asyncio.gather(
                 _vlm.describe_overall(VLM1_SYSTEM, data_url),
-                _vlm.describe_judgment(VLM3_SYSTEM, data_url, _current_question_text(messages, last_user_idx)),
+                _vlm.describe_judgment(VLM3_SYSTEM, data_url, judgment_q),
             )
             return overall, None, judgment
 
         pair_results = await asyncio.gather(
-            *[vlm_pair(d) for d in data_urls], return_exceptions=True
+            *[vlm_pair(d, k + 1) for k, d in enumerate(data_urls)],
+            return_exceptions=True,
         )
         pi = 0
         for i, item in enumerate(per_image):
@@ -608,16 +522,7 @@ async def route_chat_completions(body: dict):
                 logger.error("VLM failed: %s", res)
                 raise VisionUnavailable from res
             overall, focus, judgment = res
-            cached = {"overall": overall, "focus": focus, "judgment": judgment}
-            per_image[i] = cached
-            _cache_desc(
-                _desc_cache_key(
-                    image_utils.image_hash(pending_urls[pi - 1]), cur_text
-                ),
-                overall,
-                focus,
-                judgment,
-            )
+            per_image[i] = {"overall": overall, "focus": focus, "judgment": judgment}
 
     merged_blocks = merger.merge_multi_image(per_image)
 

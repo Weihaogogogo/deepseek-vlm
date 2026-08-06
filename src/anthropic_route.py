@@ -19,14 +19,9 @@ from .router import (
     PROMPTS_DIR,
     ClientRequestError,
     VisionUnavailable,
-    _DESC_CACHE,
-    _cache_desc,
-    _desc_cache_key,
     _ensure_reasoning_content,
     _current_question_text,
     _extract_current_images,
-    _find_cached_history_image,
-    _inject_history_description,
     _normalize_tool_pairing,
     _parse_content,
     _parse_stream,
@@ -106,27 +101,16 @@ async def route_messages(body: dict):
             s = _strip_message_images(message)
             if s is not None:
                 stripped.append(s)
-        cached = _find_cached_history_image(messages, cur_text)
-        if cached is not None:
-            stripped = _inject_history_description(stripped, cached)
-            logger.info("anthropic history image description injected (len=%d)", len(cached))
         stripped = _ensure_reasoning_content(stripped)
         fwd_messages = _prepend_system(stripped, system_text)
         return await _forward_anthropic(fwd_messages, params, model, stream)
 
-    # Cache lookup BEFORE any download (see router.py route_chat_completions).
     run_vlm2 = len(cur_text.strip()) > 1
 
     per_image: list[dict | None] = []
-    pending_urls: list[str] = []
     for url in cur_images:
-        cache_key = _desc_cache_key(image_utils.image_hash(url), cur_text)
-        cached = _DESC_CACHE.get(cache_key)
-        if cached is not None:
-            per_image.append(cached)
-        else:
-            per_image.append(None)
-            pending_urls.append(url)
+        per_image.append(None)
+    pending_urls = list(cur_images)
 
     if pending_urls:
         try:
@@ -136,22 +120,31 @@ async def route_messages(body: dict):
         except ImageParseError as exc:
             raise ClientRequestError(f"invalid image: {exc}", code="invalid_image") from exc
 
-        async def vlm_pair(data_url: str) -> tuple[str, str | None, str | None]:
+        async def vlm_pair(data_url: str, k: int) -> tuple[str, str | None, str | None]:
+            # 告知 VLM 本轮图片总数与当前序号：防止它看到问题文本提到其他图
+            # 就误报"缺失"（每张图独立调用，VLM 只能看到自己这一张）。
+            total = len(cur_images)
+            focus_q = f"本轮共 {total} 张图，你正在看第 {k} 张（仅此一张）。用户问题：{cur_text}"
+            judgment_q = (
+                f"本轮共 {total} 张图，你正在看第 {k} 张（仅此一张）。用户问题："
+                f"{_current_question_text(messages, last_user_idx)}"
+            )
             if run_vlm2:
                 overall, focus, judgment = await asyncio.gather(
                     _vlm.describe_overall(VLM1_SYSTEM, data_url),
-                    _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text),
-                    _vlm.describe_judgment(VLM3_SYSTEM, data_url, _current_question_text(messages, last_user_idx)),
+                    _vlm.describe_focus(VLM2_SYSTEM, data_url, focus_q),
+                    _vlm.describe_judgment(VLM3_SYSTEM, data_url, judgment_q),
                 )
                 return overall, focus, judgment
             overall, judgment = await asyncio.gather(
                 _vlm.describe_overall(VLM1_SYSTEM, data_url),
-                _vlm.describe_judgment(VLM3_SYSTEM, data_url, _current_question_text(messages, last_user_idx)),
+                _vlm.describe_judgment(VLM3_SYSTEM, data_url, judgment_q),
             )
             return overall, None, judgment
 
         pair_results = await asyncio.gather(
-            *[vlm_pair(d) for d in data_urls], return_exceptions=True
+            *[vlm_pair(d, k + 1) for k, d in enumerate(data_urls)],
+            return_exceptions=True,
         )
         pi = 0
         for i, item in enumerate(per_image):
@@ -163,16 +156,7 @@ async def route_messages(body: dict):
                 logger.error("anthropic VLM failed: %s", res)
                 raise VisionUnavailable from res
             overall, focus, judgment = res
-            cached = {"overall": overall, "focus": focus, "judgment": judgment}
-            per_image[i] = cached
-            _cache_desc(
-                _desc_cache_key(
-                    image_utils.image_hash(pending_urls[pi - 1]), cur_text
-                ),
-                overall,
-                focus,
-                judgment,
-            )
+            per_image[i] = {"overall": overall, "focus": focus, "judgment": judgment}
 
     merged_blocks = merger.merge_multi_image(per_image)
 

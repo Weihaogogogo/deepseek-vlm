@@ -5,8 +5,7 @@
   同轮去重、10 张截断、纯图 tool 消息回退
 - _normalize_tool_pairing：tool 消息被 user 文本隔开的重排（Claude Code 形态）
 - _strip_message_images：当前轮 [图片 N] / 历史 [历史图片] 占位符保序；
-  纯图 tool 消息回填缓存整体描述 / 占位文本（曾回填空串）
-- _desc_cache_key：同图不同问题必须不同缓存键（焦点串味修复）
+  纯图 tool 消息回填占位文本（曾回填空串）
 - _forward vision_prefix：VLM 描述注入 assistant reasoning_content 前缀
 - 组装布局：历史 → user(问题+[图片 N]) → user(merged 块数组) → user(LLM_SYSTEM)
 """
@@ -17,23 +16,13 @@ import pytest
 
 from src import image_utils, merger, router
 from src.router import (
-    _cache_desc,
-    _desc_cache_key,
     _ensure_reasoning_content,
     _extract_current_images,
-    _find_cached_overall,
     _normalize_tool_pairing,
     _parse_content,
     _parse_stream,
     _strip_message_images,
 )
-
-# _DESC_CACHE 是模块级全局，测试间必须清空
-@pytest.fixture(autouse=True)
-def clear_desc_cache():
-    router._DESC_CACHE.clear()
-    yield
-    router._DESC_CACHE.clear()
 
 
 def _img_part(url):
@@ -251,14 +240,8 @@ class TestStripMessageImages:
     def _pure_image_tool_msg(self):
         return {"role": "tool", "tool_call_id": "call_1", "content": [_img_part(self.URL)]}
 
-    def test_pure_image_tool_backfills_cached_overall(self):
-        _cache_desc(_desc_cache_key(image_utils.image_hash(self.URL), "问题"), "整体描述A", None)
-        out = _strip_message_images(self._pure_image_tool_msg())
-        assert out["content"] == "整体描述A"
-
-    def test_pure_image_tool_cache_miss_placeholder_not_empty(self):
-        # 已修复 bug 回归：曾回填空串，deepseek 误判"read_file 返回空"；
-        # 必须回填非空占位文本
+    def test_pure_image_tool_placeholder_not_empty(self):
+        # 无状态设计：tool 纯图消息不查缓存，直接回填非空占位文本
         out = _strip_message_images(self._pure_image_tool_msg())
         assert isinstance(out["content"], str)
         assert out["content"]
@@ -330,32 +313,6 @@ class TestStripMessageImages:
     def test_text_only_array_still_flattened(self):
         out = _strip_message_images({"role": "user", "content": [_text_part("a"), _text_part("b")]})
         assert out["content"] == "ab"
-
-
-# ---------- 描述缓存键 ----------
-
-class TestDescCache:
-    def test_same_image_different_question_different_keys(self):
-        # 焦点串味修复回归：VLM-2 focus 是问题驱动的，
-        # 同一张图不同问题必须命中不同缓存条目
-        k1 = _desc_cache_key("hashA", "这个按钮为什么点不了")
-        k2 = _desc_cache_key("hashA", "图片里有哪些文字")
-        assert k1 != k2
-        assert k1.startswith("hashA|") and k2.startswith("hashA|")
-
-    def test_find_cached_overall_ignores_question_fingerprint(self):
-        # 纯图 tool_result 回填没有问题可用，_find_cached_overall
-        # 必须忽略问题指纹找到整体描述
-        _cache_desc(_desc_cache_key("hashB", "问题1"), "整体1", "重点1")
-        assert _find_cached_overall("hashB") == "整体1"
-
-    def test_find_cached_overall_returns_most_recent_entry(self):
-        _cache_desc(_desc_cache_key("hashC", "问题1"), "整体1", None)
-        _cache_desc(_desc_cache_key("hashC", "问题2"), "整体2", None)
-        assert _find_cached_overall("hashC") == "整体2"
-
-    def test_find_cached_overall_miss_returns_none(self):
-        assert _find_cached_overall("hashX") is None
 
 
 # ---------- _parse_stream ----------
@@ -557,9 +514,6 @@ class TestVlmPairThreeWay:
         # judgment 进入合并块文本（vision_prefix → reasoning_content）
         msg = json.loads(resp.body)["choices"][0]["message"]
         assert "整体描述\n---\n重点描述\n---\n判断描述" in msg["reasoning_content"]
-        # 缓存条目含 judgment
-        assert len(router._DESC_CACHE) == 1
-        assert next(iter(router._DESC_CACHE.values()))["judgment"] == "判断描述"
 
     def test_pure_image_without_question_skips_focus(self, monkeypatch):
         # run_vlm2 = len(cur_text.strip()) > 1：纯图无文本 → focus 不跑，
@@ -574,8 +528,6 @@ class TestVlmPairThreeWay:
         )
         assert "focus" not in calls
         assert set(calls) == {"overall", "judgment"}
-        assert len(router._DESC_CACHE) == 1
-        assert next(iter(router._DESC_CACHE.values()))["judgment"] == "判断描述"
 
     def test_judgment_gets_current_question_not_history(self, monkeypatch):
         # VLM-3 的输入必须只含当前问题，不能带历史对话上下文（防止判断被
@@ -615,74 +567,58 @@ class TestVlmPairThreeWay:
             )
         )
         assert len(judgment_questions) == 1
-        assert judgment_questions[0] == "这是谁"
+        # 带"本轮共 N 张图"前缀 + 当前问题；不含历史上下文
+        assert "本轮共 1 张图" in judgment_questions[0]
+        assert "这是谁" in judgment_questions[0]
         assert "之前聊过什么" not in judgment_questions[0]
         assert "之前回答过" not in judgment_questions[0]
 
+    def test_multi_image_knows_total_and_index(self, monkeypatch):
+        # 多图时 VLM-2/VLM-3 收到"本轮共 N 张、看第 K 张"前缀，避免误报缺失
+        calls = {"focus": [], "judgment": []}
 
-# ---------- 旧缓存条目兼容（无 judgment） ----------
+        async def fake_overall(system_prompt, data_url):
+            return "整体描述"
 
-class TestCacheBackwardCompat:
-    """旧缓存条目没有 judgment：读取与合并不崩，判断段省略。"""
+        async def fake_focus(system_prompt, data_url, question):
+            calls["focus"].append(question)
+            return "重点描述"
 
-    URL = "http://img/old.png"
+        async def fake_judgment(system_prompt, data_url, question):
+            calls["judgment"].append(question)
+            return "判断描述"
 
-    def test_history_merge_old_entry_without_judgment(self):
-        msgs = [
-            _user([_img_part(self.URL)]),
-            {"role": "assistant", "content": "看过了"},
-            _user("那张图里是谁？"),
-        ]
-        cur_text = router._pick_focus_text(msgs)
-        key = _desc_cache_key(image_utils.image_hash(self.URL), cur_text)
-        router._DESC_CACHE[key] = {"overall": "旧整体", "focus": "旧重点"}  # 旧格式
-        merged = router._find_cached_history_image(msgs, cur_text)
-        assert merged is not None
-        assert merged == [{"type": "text", "text": "旧整体\n---\n旧重点"}]
-
-    def test_history_merge_new_entry_with_judgment(self):
-        msgs = [
-            _user([_img_part(self.URL)]),
-            {"role": "assistant", "content": "看过了"},
-            _user("那张图里是谁？"),
-        ]
-        cur_text = router._pick_focus_text(msgs)
-        key = _desc_cache_key(image_utils.image_hash(self.URL), cur_text)
-        router._DESC_CACHE[key] = {
-            "overall": "整体", "focus": "重点", "judgment": "迪丽热巴",
-        }
-        merged = router._find_cached_history_image(msgs, cur_text)
-        assert merged == [{"type": "text", "text": "整体\n---\n重点\n---\n迪丽热巴"}]
-
-    def test_image_turn_old_entry_cache_hit_no_crash(self, monkeypatch):
-        # 有图轮命中旧格式缓存：不下载不调 VLM，合并输出无判断段
-        msgs = [_user([_text_part("问题"), _img_part(self.URL)])]
-        cur_text = router._pick_focus_text(msgs)
-        key = _desc_cache_key(image_utils.image_hash(self.URL), cur_text)
-        router._DESC_CACHE[key] = {"overall": "旧整体", "focus": "旧重点"}
+        async def fake_prepare(url):
+            return "data:image/png;base64,AAAA"
 
         async def fake_complete(messages, body):
-            return {
-                "id": "chatcmpl_1",
-                "object": "chat.completion",
-                "created": 1,
-                "model": "deepseek",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "回答"},
-                    "finish_reason": "stop",
-                }],
-            }
+            return self._reply()
 
+        monkeypatch.setattr(router._vlm, "describe_overall", fake_overall)
+        monkeypatch.setattr(router._vlm, "describe_focus", fake_focus)
+        monkeypatch.setattr(router._vlm, "describe_judgment", fake_judgment)
+        monkeypatch.setattr(image_utils, "prepare_image", fake_prepare)
         monkeypatch.setattr(router._llm, "complete", fake_complete)
-        # 不 patch prepare_image：缓存命中必须完全跳过下载/压缩
-        resp = asyncio.run(
+
+        msgs = [_user([
+            _text_part("看这两张"),
+            _img_part("http://img/a.png"),
+            _img_part("http://img/b.png"),
+        ])]
+        asyncio.run(
             router.route_chat_completions(
                 {"messages": msgs, "model": "m", "stream": False}
             )
         )
-        msg = json.loads(resp.body)["choices"][0]["message"]
-        assert "旧整体\n---\n旧重点" in msg["reasoning_content"]
+        assert len(calls["focus"]) == 2
+        assert len(calls["judgment"]) == 2
+        # 图1 看第 1 张、图2 看第 2 张，都是"共 2 张"
+        assert "本轮共 2 张图，你正在看第 1 张" in calls["focus"][0]
+        assert "本轮共 2 张图，你正在看第 2 张" in calls["focus"][1]
+        assert "本轮共 2 张图，你正在看第 1 张" in calls["judgment"][0]
+        assert "本轮共 2 张图，你正在看第 2 张" in calls["judgment"][1]
+        # 编号与 merged 块顺序一致（数组下标）
+        assert "看这两张" in calls["focus"][0]
 
 
 # ---------- 组装布局 ----------
@@ -792,65 +728,4 @@ class TestAssemblyLayout:
         assert out[3]["content"] == [
             {"type": "text", "text": "整体描述\n---\n重点描述\n---\n判断描述"}
         ]
-        assert out[4]["content"] == router.LLM_SYSTEM
 
-
-class TestInjectHistoryDescription:
-    """无图轮注入布局：历史 → user(问题) → user(merged 块) → user(LLM_SYSTEM)。"""
-
-    def test_blocks_inserted_after_last_user(self):
-        stripped = [
-            {"role": "user", "content": "历史问题"},
-            {"role": "assistant", "content": "历史回答"},
-            {"role": "user", "content": "当前问题"},
-        ]
-        blocks = [{"type": "text", "text": "整体\n---\n重点"}]
-        out = router._inject_history_description(stripped, blocks)
-        assert out[:3] == stripped
-        assert out[3] == {"role": "user", "content": blocks}
-        assert out[4] == {"role": "user", "content": router.LLM_SYSTEM}
-        assert len(out) == 5
-
-    def test_no_image_turn_cached_history_layout(self, monkeypatch):
-        # 完整无图轮流程：历史图占位 + 注入块插在当前问题之后、LLM_SYSTEM 最后
-        captured = []
-
-        async def fake_complete(messages, body):
-            captured.append(messages)
-            return {
-                "id": "chatcmpl_1",
-                "object": "chat.completion",
-                "created": 1,
-                "model": "deepseek",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "回答"},
-                    "finish_reason": "stop",
-                }],
-            }
-
-        monkeypatch.setattr(router._llm, "complete", fake_complete)
-        msgs = [
-            _user([_img_part("http://img/hist.png")]),
-            {"role": "assistant", "content": "看过了"},
-            _user("那张图里是谁？"),
-        ]
-        cur_text = router._pick_focus_text(msgs)
-        key = _desc_cache_key(image_utils.image_hash("http://img/hist.png"), cur_text)
-        router._DESC_CACHE[key] = {
-            "overall": "整体", "focus": "重点", "judgment": "迪丽热巴",
-        }
-        asyncio.run(
-            router.route_chat_completions(
-                {"messages": msgs, "model": "m", "stream": False}
-            )
-        )
-        out = captured[0]
-        assert out[0]["content"] == [_text_part("[历史图片]")]
-        assert out[1] == msgs[1]
-        assert out[2] == msgs[2]  # 当前问题保留原样
-        assert out[3]["content"] == [
-            {"type": "text", "text": "整体\n---\n重点\n---\n迪丽热巴"}
-        ]
-        assert out[4]["content"] == router.LLM_SYSTEM
-        assert len(out) == 5
