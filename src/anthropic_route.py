@@ -2,7 +2,7 @@
 
 Request flow: parse Anthropic body -> OpenAI-format messages ->
 no-image: passthrough to deepseek (with Anthropic system prepended)
-image: dual-VLM + merge + LLM_SYSTEM injection -> forward.
+image: triple-VLM (overall + focus + judgment) + merge + LLM_SYSTEM injection -> forward.
 Response flow: OpenAI response -> Anthropic message / SSE events.
 """
 import asyncio
@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 LLM_SYSTEM = (PROMPTS_DIR / "llm_system.md").read_text(encoding="utf-8")
 VLM1_SYSTEM = (PROMPTS_DIR / "vlm1_system.md").read_text(encoding="utf-8")
 VLM2_SYSTEM = (PROMPTS_DIR / "vlm2_system.md").read_text(encoding="utf-8")
+VLM3_SYSTEM = (PROMPTS_DIR / "vlm3_system.md").read_text(encoding="utf-8")
 
 _llm = DeepSeekClient()
 _vlm = VLMClient(config.DASHSCOPE_API_KEY)
@@ -134,15 +135,19 @@ async def route_messages(body: dict):
         except ImageParseError as exc:
             raise ClientRequestError(f"invalid image: {exc}", code="invalid_image") from exc
 
-        async def vlm_pair(data_url: str) -> tuple[str, str | None]:
+        async def vlm_pair(data_url: str) -> tuple[str, str | None, str | None]:
             if run_vlm2:
-                overall, focus = await asyncio.gather(
+                overall, focus, judgment = await asyncio.gather(
                     _vlm.describe_overall(VLM1_SYSTEM, data_url),
                     _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text),
+                    _vlm.describe_judgment(VLM3_SYSTEM, data_url, cur_text),
                 )
-                return overall, focus
-            overall = await _vlm.describe_overall(VLM1_SYSTEM, data_url)
-            return overall, None
+                return overall, focus, judgment
+            overall, judgment = await asyncio.gather(
+                _vlm.describe_overall(VLM1_SYSTEM, data_url),
+                _vlm.describe_judgment(VLM3_SYSTEM, data_url, cur_text),
+            )
+            return overall, None, judgment
 
         pair_results = await asyncio.gather(
             *[vlm_pair(d) for d in data_urls], return_exceptions=True
@@ -156,8 +161,8 @@ async def route_messages(body: dict):
             if isinstance(res, Exception):
                 logger.error("anthropic VLM failed: %s", res)
                 raise VisionUnavailable from res
-            overall, focus = res
-            cached = {"overall": overall, "focus": focus}
+            overall, focus, judgment = res
+            cached = {"overall": overall, "focus": focus, "judgment": judgment}
             per_image[i] = cached
             _cache_desc(
                 _desc_cache_key(
@@ -165,6 +170,7 @@ async def route_messages(body: dict):
                 ),
                 overall,
                 focus,
+                judgment,
             )
 
     merged = merger.merge_multi_image(per_image, cur_text)

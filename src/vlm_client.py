@@ -1,4 +1,5 @@
-"""qwen3-vl-flash calls: VLM-1 overall transcription, VLM-2 focused description."""
+"""qwen3-vl-flash calls: VLM-1 overall transcription, VLM-2 focused description,
+VLM-3 direct judgment."""
 import asyncio
 import logging
 
@@ -102,3 +103,10 @@ class VLMClient:
             if VLM2_HEADER not in content:
                 logger.warning("VLM-2 retry still missing '%s'", VLM2_HEADER)
         return content
+
+    async def describe_judgment(self, system_prompt: str, data_url: str, question: str) -> str:
+        """VLM-3: direct judgment/answer, not constrained to description-only."""
+        text = f"对话上下文（最新用户提问在末尾）：\n{question}\n请直接回答。"
+        return await self._complete(
+            system_prompt, [self._image_part(data_url), self._text_part(text)]
+        )

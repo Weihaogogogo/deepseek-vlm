@@ -28,6 +28,7 @@ def _read_prompt(name: str) -> str:
 
 VLM1_SYSTEM = _read_prompt("vlm1_system.md")
 VLM2_SYSTEM = _read_prompt("vlm2_system.md")
+VLM3_SYSTEM = _read_prompt("vlm3_system.md")
 LLM_SYSTEM = _read_prompt("llm_system.md")
 
 _llm = DeepSeekClient()
@@ -105,8 +106,10 @@ def _find_cached_overall(image_key: str) -> str | None:
     return None
 
 
-def _cache_desc(key: str, overall: str, focus: str | None) -> None:
-    _DESC_CACHE[key] = {"overall": overall, "focus": focus}
+def _cache_desc(
+    key: str, overall: str, focus: str | None, judgment: str | None = None
+) -> None:
+    _DESC_CACHE[key] = {"overall": overall, "focus": focus, "judgment": judgment}
     _DESC_CACHE.move_to_end(key)
     while len(_DESC_CACHE) > _DESC_CACHE_MAX:
         _DESC_CACHE.popitem(last=False)
@@ -129,7 +132,10 @@ def _find_cached_history_image(messages: list, question: str) -> str | None:
             if key in _DESC_CACHE:
                 cached = _DESC_CACHE[key]
                 return merger.merge_image_info(
-                    cached.get("overall", ""), cached.get("focus"), question
+                    cached.get("overall", ""),
+                    cached.get("focus"),
+                    question,
+                    cached.get("judgment"),
                 )
         return None  # has images but none cached; stop at the newest one
     return None
@@ -538,15 +544,19 @@ async def route_chat_completions(body: dict):
                 f"invalid image url: {exc}", code="invalid_image_url"
             ) from exc
 
-        async def vlm_pair(data_url: str) -> tuple[str, str | None]:
+        async def vlm_pair(data_url: str) -> tuple[str, str | None, str | None]:
             if run_vlm2:
-                overall, focus = await asyncio.gather(
+                overall, focus, judgment = await asyncio.gather(
                     _vlm.describe_overall(VLM1_SYSTEM, data_url),
                     _vlm.describe_focus(VLM2_SYSTEM, data_url, cur_text),
+                    _vlm.describe_judgment(VLM3_SYSTEM, data_url, cur_text),
                 )
-                return overall, focus
-            overall = await _vlm.describe_overall(VLM1_SYSTEM, data_url)
-            return overall, None
+                return overall, focus, judgment
+            overall, judgment = await asyncio.gather(
+                _vlm.describe_overall(VLM1_SYSTEM, data_url),
+                _vlm.describe_judgment(VLM3_SYSTEM, data_url, cur_text),
+            )
+            return overall, None, judgment
 
         pair_results = await asyncio.gather(
             *[vlm_pair(d) for d in data_urls], return_exceptions=True
@@ -560,8 +570,8 @@ async def route_chat_completions(body: dict):
             if isinstance(res, Exception):
                 logger.error("VLM failed: %s", res)
                 raise VisionUnavailable from res
-            overall, focus = res
-            cached = {"overall": overall, "focus": focus}
+            overall, focus, judgment = res
+            cached = {"overall": overall, "focus": focus, "judgment": judgment}
             per_image[i] = cached
             _cache_desc(
                 _desc_cache_key(
@@ -569,6 +579,7 @@ async def route_chat_completions(body: dict):
                 ),
                 overall,
                 focus,
+                judgment,
             )
 
     merged = merger.merge_multi_image(per_image, cur_text)

@@ -416,3 +416,151 @@ class TestForwardVisionPrefix:
         second = json.loads(lines[1][len("data: "):].strip())
         assert second["choices"][0]["delta"]["content"] == "你好"
         assert lines[-1] == "data: [DONE]\n\n"
+
+
+# ---------- VLM-3 三路并发 ----------
+
+class TestVlmPairThreeWay:
+    """有图轮 vlm_pair 三路并发（monkeypatch _vlm / prepare_image / _llm.complete，无网络）。"""
+
+    URL = "http://img/v3.png"
+
+    @staticmethod
+    def _reply():
+        return {
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "deepseek",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "回答正文"},
+                "finish_reason": "stop",
+            }],
+        }
+
+    def _patch_vlm(self, monkeypatch, calls):
+        async def fake_overall(system_prompt, data_url):
+            calls.append("overall")
+            return "整体描述"
+
+        async def fake_focus(system_prompt, data_url, question):
+            calls.append("focus")
+            return "重点描述"
+
+        async def fake_judgment(system_prompt, data_url, question):
+            calls.append("judgment")
+            return "判断描述"
+
+        async def fake_prepare(url):
+            return "data:image/png;base64,AAAA"
+
+        async def fake_complete(messages, body):
+            return self._reply()
+
+        monkeypatch.setattr(router._vlm, "describe_overall", fake_overall)
+        monkeypatch.setattr(router._vlm, "describe_focus", fake_focus)
+        monkeypatch.setattr(router._vlm, "describe_judgment", fake_judgment)
+        monkeypatch.setattr(image_utils, "prepare_image", fake_prepare)
+        monkeypatch.setattr(router._llm, "complete", fake_complete)
+
+    def test_image_with_question_runs_three_vlms(self, monkeypatch):
+        calls = []
+        self._patch_vlm(monkeypatch, calls)
+        msgs = [_user([_text_part("这是谁"), _img_part(self.URL)])]
+        resp = asyncio.run(
+            router.route_chat_completions(
+                {"messages": msgs, "model": "deepseek-v4-flash-vl", "stream": False}
+            )
+        )
+        assert set(calls) == {"overall", "focus", "judgment"}
+        # judgment 进入合并文本（vision_prefix → reasoning_content）
+        msg = json.loads(resp.body)["choices"][0]["message"]
+        assert "【图片·判断】\n判断描述" in msg["reasoning_content"]
+        assert "【图片·整体】\n整体描述" in msg["reasoning_content"]
+        # 缓存条目含 judgment
+        assert len(router._DESC_CACHE) == 1
+        assert next(iter(router._DESC_CACHE.values()))["judgment"] == "判断描述"
+
+    def test_pure_image_without_question_skips_focus(self, monkeypatch):
+        # run_vlm2 = len(cur_text.strip()) > 1：纯图无文本 → focus 不跑，
+        # judgment 仍跑（判断不依赖问题文本，有图就判断）
+        calls = []
+        self._patch_vlm(monkeypatch, calls)
+        msgs = [_user([_img_part(self.URL)])]
+        asyncio.run(
+            router.route_chat_completions(
+                {"messages": msgs, "model": "m", "stream": False}
+            )
+        )
+        assert "focus" not in calls
+        assert set(calls) == {"overall", "judgment"}
+        assert len(router._DESC_CACHE) == 1
+        assert next(iter(router._DESC_CACHE.values()))["judgment"] == "判断描述"
+
+
+# ---------- 旧缓存条目兼容（无 judgment） ----------
+
+class TestCacheBackwardCompat:
+    """旧缓存条目没有 judgment：读取与合并不崩，判断段省略。"""
+
+    URL = "http://img/old.png"
+
+    def test_history_merge_old_entry_without_judgment(self):
+        msgs = [
+            _user([_img_part(self.URL)]),
+            {"role": "assistant", "content": "看过了"},
+            _user("那张图里是谁？"),
+        ]
+        cur_text = router._pick_focus_text(msgs)
+        key = _desc_cache_key(image_utils.image_hash(self.URL), cur_text)
+        router._DESC_CACHE[key] = {"overall": "旧整体", "focus": "旧重点"}  # 旧格式
+        merged = router._find_cached_history_image(msgs, cur_text)
+        assert merged is not None
+        assert "旧整体" in merged and "旧重点" in merged
+        assert "【图片·判断】" not in merged
+
+    def test_history_merge_new_entry_with_judgment(self):
+        msgs = [
+            _user([_img_part(self.URL)]),
+            {"role": "assistant", "content": "看过了"},
+            _user("那张图里是谁？"),
+        ]
+        cur_text = router._pick_focus_text(msgs)
+        key = _desc_cache_key(image_utils.image_hash(self.URL), cur_text)
+        router._DESC_CACHE[key] = {
+            "overall": "整体", "focus": "重点", "judgment": "迪丽热巴",
+        }
+        merged = router._find_cached_history_image(msgs, cur_text)
+        assert "【图片·判断】\n迪丽热巴" in merged
+
+    def test_image_turn_old_entry_cache_hit_no_crash(self, monkeypatch):
+        # 有图轮命中旧格式缓存：不下载不调 VLM，合并输出无判断段
+        msgs = [_user([_text_part("问题"), _img_part(self.URL)])]
+        cur_text = router._pick_focus_text(msgs)
+        key = _desc_cache_key(image_utils.image_hash(self.URL), cur_text)
+        router._DESC_CACHE[key] = {"overall": "旧整体", "focus": "旧重点"}
+
+        async def fake_complete(messages, body):
+            return {
+                "id": "chatcmpl_1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "deepseek",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "回答"},
+                    "finish_reason": "stop",
+                }],
+            }
+
+        monkeypatch.setattr(router._llm, "complete", fake_complete)
+        # 不 patch prepare_image：缓存命中必须完全跳过下载/压缩
+        resp = asyncio.run(
+            router.route_chat_completions(
+                {"messages": msgs, "model": "m", "stream": False}
+            )
+        )
+        msg = json.loads(resp.body)["choices"][0]["message"]
+        assert "旧整体" in msg["reasoning_content"]
+        assert "【图片·判断】" not in msg["reasoning_content"]
