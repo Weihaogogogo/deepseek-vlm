@@ -378,12 +378,26 @@ def _parse_stream(value) -> bool:
     return bool(value)
 
 
-def _validate_messages(messages: list) -> None:
+def _validate_messages(messages: list) -> list:
+    """Validate messages and return the list with unknown-role entries dropped.
+
+    Unknown roles (e.g. WorkBuddy's internal ``session_meta`` metadata rows,
+    content=None) are harness bookkeeping, not conversation turns — dropping
+    them instead of 400 keeps the gateway tolerant of client-internal roles
+    while deepseek only ever sees valid roles. Real protocol errors (non-dict
+    message, missing role, missing content) still raise.
+    """
+    kept: list[dict] = []
     for i, message in enumerate(messages):
         if not isinstance(message, dict) or not isinstance(message.get("role"), str):
             raise ClientRequestError(f"each message must be an object with a role (index {i})")
         if message["role"] not in VALID_ROLES:
-            raise ClientRequestError(f"unsupported role: {message['role']} (index {i})")
+            logger.warning(
+                "dropping message with unknown role %r (index %d) — client-internal metadata",
+                message["role"],
+                i,
+            )
+            continue
         if message.get("content") is None and "tool_calls" not in message:
             raise ClientRequestError(f"message missing content (index {i})")
         if message.get("content") is not None:
@@ -394,6 +408,8 @@ def _validate_messages(messages: list) -> None:
                     f"invalid message content at index {i} role={message['role']} "
                     f"ctype={type(message['content']).__name__}: {exc}"
                 ) from exc
+        kept.append(message)
+    return kept
 
 
 async def _forward(
@@ -450,7 +466,7 @@ async def route_chat_completions(body: dict):
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise ClientRequestError("messages must be a non-empty array")
-    _validate_messages(messages)
+    messages = _validate_messages(messages)
 
     stream = _parse_stream(body.get("stream", False))
     model = body.get("model")

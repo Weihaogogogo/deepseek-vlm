@@ -78,7 +78,7 @@ async def route_messages(body: dict):
     except ValueError as exc:
         raise ClientRequestError(str(exc)) from exc
 
-    _validate_messages(messages)
+    messages = _validate_messages(messages)
     stream = _parse_stream(body.get("stream", False))
     model = body.get("model")
     if model is None or model == "":

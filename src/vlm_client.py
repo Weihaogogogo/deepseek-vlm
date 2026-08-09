@@ -10,9 +10,9 @@ logger = logging.getLogger(__name__)
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 VLM_MODEL = "qwen3.7-flash"
 # 不设 max_tokens（生硬截断会掐断描述），VLM 完整输出需要 20-35s。
-# 超时放宽到 60s，让慢但正常的调用完成；重试去掉（60s 已足够区分
-# 慢/死，重试会让单路最坏 120s，撞网关总预算被误杀）。
-VLM_TIMEOUT = 60.0
+# 超时 120s（用户要求 2026-08）：大图/长描述慢但正常的调用也能完成；
+# 重试去掉（重试会让单路最坏超 120s，撞网关总预算被误杀）。
+VLM_TIMEOUT = 120.0
 
 VLM2_HEADER = "# 重点细节"
 VLM2_RETRY_PROMPT = "你没有按规范输出，请严格遵守系统规范，只输出聚焦描述"

@@ -28,6 +28,18 @@ app = FastAPI(
 )
 
 
+# 必须注册在最外层：WorkBuddy 中转层在 keep-alive 连接上重放旧报文导致
+# 400；所有业务响应带 Connection: close 后 h11 响应完即断连，补发只能走
+# 新连接正常组装。内层中间件（body 大小 413 / 请求预算 502）的早退响应
+# 也会经过本中间件补上该头。
+@app.middleware("http")
+async def _connection_close(request: Request, call_next):
+    resp = await call_next(request)
+    if request.url.path in ("/v1/chat/completions", "/v1/messages"):
+        resp.headers["connection"] = "close"
+    return resp
+
+
 @app.middleware("http")
 async def _limit_body_size(request: Request, call_next):
     """Reject request bodies over 50MB with a 413 before the route parses them."""
@@ -76,9 +88,9 @@ async def _limit_body_size(request: Request, call_next):
 
 
 # 请求总预算：上游（DashScope/deepseek）故障时网关必须快速失败，而不是让
-# 客户端无限等待。必须大于 VLM_TIMEOUT(60s) + deepseek 调用时间，否则正常
-# 请求（VLM 慢但成功）会被误杀。90s 给完整链路留余量，故障时仍兜底。
-REQUEST_TIMEOUT_SECONDS = 90
+# 客户端无限等待。必须大于 VLM_TIMEOUT(120s) + deepseek 调用时间，否则正常
+# 请求（VLM 慢但成功）会被误杀。150s 给完整链路留余量，故障时仍兜底。
+REQUEST_TIMEOUT_SECONDS = 150
 
 
 @app.middleware("http")
@@ -118,6 +130,76 @@ def _error(status: int, message: str, type_: str, code: str) -> JSONResponse:
         status_code=status,
         content={"error": {"message": message, "type": type_, "code": code}},
     )
+
+
+def _parse_wrapped_http(raw: bytes) -> dict:
+    """Split a raw HTTP-message-wrapped body into request line / headers / JSON head.
+
+    WorkBuddy sends the full outgoing HTTP request as the POST body; splitting
+    the message lets the failure log show which inner request was wrapped and
+    its internal Content-Length.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    first_line = text.split("\r\n", 1)[0] if text else ""
+    header_block = ""
+    json_head = ""
+    if "\r\n\r\n" in text:
+        header_block, json_head = text.split("\r\n\r\n", 1)
+    return {
+        "first_line": first_line,
+        "header_block": header_block,
+        "json_head": json_head,
+    }
+
+
+async def _load_json_body(request: Request) -> dict:
+    """Parse the request body as JSON, honoring gzip Content-Encoding.
+
+    Some desktop harnesses (WorkBuddy) gzip large request bodies; Starlette's
+    ``request.json()`` does NOT auto-decompress, so compressed bytes fail
+    json.loads -> 400 "invalid JSON body". Decompress first, then parse.
+    On failure, logs a detailed diagnostic (encoding, lengths, head/tail of
+    the raw bytes) so the offending request can be identified without asking
+    the user to reproduce again.
+    """
+    import gzip
+    import json as _json
+
+    raw = await request.body()  # cached by the size-limiting middleware
+    enc = (request.headers.get("content-encoding") or "").lower().strip()
+    if enc == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "gzip decompress failed: %s len=%d head=%r", exc, len(raw), raw[:120]
+            )
+            raise
+        if len(raw) > MAX_BODY_BYTES:
+            raise ValueError("decompressed body exceeds 50MB")
+    elif enc and enc != "identity":
+        logger.warning(
+            "unsupported content-encoding %r (len=%d) — treating as plain JSON",
+            enc,
+            len(raw),
+        )
+    try:
+        return _json.loads(raw.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        wrapped = _parse_wrapped_http(raw)
+        logger.error(
+            "invalid JSON body: enc=%r len=%d content-length=%r first_line=%r "
+            "header_block=%r json_head=%r tail=%r err=%s",
+            enc,
+            len(raw),
+            request.headers.get("content-length"),
+            wrapped["first_line"][:120],
+            wrapped["header_block"][:500],
+            wrapped["json_head"][:300],
+            raw[-80:],
+            exc,
+        )
+        raise
 
 
 class AuthError(Exception):
@@ -180,7 +262,7 @@ async def list_models(request: Request):
 async def chat_completions(request: Request):
     _check_auth(request)
     try:
-        body = await request.json()
+        body = await _load_json_body(request)
     except Exception:
         return _error(400, "invalid JSON body", "invalid_request_error", "invalid_json")
     if not isinstance(body, dict):
@@ -192,7 +274,7 @@ async def chat_completions(request: Request):
 async def anthropic_messages(request: Request):
     _check_auth(request)
     try:
-        body = await request.json()
+        body = await _load_json_body(request)
     except Exception:
         return JSONResponse(
             status_code=400,
