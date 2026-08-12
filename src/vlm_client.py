@@ -68,6 +68,12 @@ class VLMClient:
                             {"role": "user", "content": user_content},
                         ],
                         temperature=0.5,
+                        # 关闭 Qwen3 思考模式（用户决定 2026-08）：实测同图
+                        # 5.4s -> 2.3s（-57%），reasoning 归零、content 反而更长
+                        # （直接输出描述），质量未见下降。三路全走 _complete，
+                        # 一处关闭全生效（三路并发，总耗时取最慢一路）。
+                        # enable_thinking 非 OpenAI 标准参数，走 extra_body 透传。
+                        extra_body={"enable_thinking": False},
                     )
                 content = resp.choices[0].message.content
                 if not content or not content.strip():

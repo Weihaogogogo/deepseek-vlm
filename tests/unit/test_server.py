@@ -155,3 +155,24 @@ def test_connection_close_e2e(monkeypatch):
     resp = client.get("/v1/models", headers=auth)
     assert resp.status_code == 200
     assert "connection" not in resp.headers
+
+
+def test_models_lists_both_public_model_ids(monkeypatch):
+    """/v1/models 同时暴露 flash-vl 与 pro-vl 两个对外模型 id。"""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(server.config, "DEEPSEEK_VLM_API_KEY", "test-key")
+    client = TestClient(server.app)
+    auth = {"Authorization": "Bearer test-key"}
+
+    resp = client.get("/v1/models", headers=auth)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "list"
+    ids = [m["id"] for m in body["data"]]
+    assert ids == [
+        server.config.PUBLIC_MODEL_NAME,
+        server.config.PUBLIC_PRO_MODEL_NAME,
+    ]
+    assert "deepseek-v4-flash-vl" in ids
+    assert "deepseek-v4-pro-vl" in ids

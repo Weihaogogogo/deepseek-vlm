@@ -420,8 +420,9 @@ async def _forward(
     vision_prefix: str | None = None,
 ):
     messages = _normalize_tool_pairing(messages)
+    upstream_model = config.resolve_upstream_model(body.get("model"))
     if stream:
-        gen = await _llm.stream(messages, body, model)
+        gen = await _llm.stream(messages, body, model, upstream_model=upstream_model)
         if vision_prefix:
             # VLM 描述先进 reasoning_content：客户端把它当思考内容，
             # 描述由此进入 harness 上下文成为跨轮资产（界面不直接展示）。
@@ -448,7 +449,7 @@ async def _forward(
 
             gen = gen_with_prefix()
         return StreamingResponse(gen, media_type="text/event-stream")
-    data = await _llm.complete(messages, body)
+    data = await _llm.complete(messages, body, upstream_model=upstream_model)
     # Keep the model field consistent with what the client requested (streaming
     # chunks already rewrite it; non-streaming must match).
     data["model"] = model

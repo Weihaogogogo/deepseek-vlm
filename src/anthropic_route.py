@@ -210,11 +210,14 @@ async def _forward_anthropic(
     """Forward to deepseek and translate the response to Anthropic format."""
     messages = _normalize_tool_pairing(messages)
     body_params = dict(params)
+    upstream_model = config.resolve_upstream_model(model)
     if stream:
         try:
             # Claude Code's /context and token accounting depend on usage in
             # the streamed response, so force include_usage=true here.
-            chunk_iter = _llm.stream_chunks(messages, body_params, force_usage=True)
+            chunk_iter = _llm.stream_chunks(
+                messages, body_params, force_usage=True, upstream_model=upstream_model
+            )
         except LLMBackendError as exc:
             _log_message_pairs(messages, exc)
             return _llm_error_response(exc)
@@ -243,7 +246,7 @@ async def _forward_anthropic(
             _stream_with_error_log(), media_type="text/event-stream"
         )
     try:
-        data = await _llm.complete(messages, body_params)
+        data = await _llm.complete(messages, body_params, upstream_model=upstream_model)
     except LLMBackendError as exc:
         _log_message_pairs(messages, exc)
         return _llm_error_response(exc)

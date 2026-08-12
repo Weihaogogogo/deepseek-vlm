@@ -110,19 +110,25 @@ class DeepSeekClient:
         chunk.model = rewrite_model
         return "data: " + chunk.model_dump_json() + "\n\n"
 
-    async def complete(self, messages: list, body: dict) -> dict:
+    async def complete(
+        self, messages: list, body: dict, upstream_model: str | None = None
+    ) -> dict:
         """Non-streaming: JSON passthrough (content-identical)."""
         params = self._passthrough_params(body)
         try:
             resp = await self._client.chat.completions.create(
-                model=self.model, messages=messages, **params
+                model=upstream_model or self.model, messages=messages, **params
             )
         except Exception as exc:
             self._raise_backend(exc)
         return resp.model_dump()
 
     async def stream_chunks(
-        self, messages: list, body: dict, force_usage: bool = False
+        self,
+        messages: list,
+        body: dict,
+        force_usage: bool = False,
+        upstream_model: str | None = None,
     ):
         """Streaming: returns the raw OpenAI chunk async iterable (for protocol adapters).
 
@@ -131,7 +137,10 @@ class DeepSeekClient:
         params = self._passthrough_params(body, stream=True, force_usage=force_usage)
         try:
             stream = await self._client.chat.completions.create(
-                model=self.model, messages=messages, stream=True, **params
+                model=upstream_model or self.model,
+                messages=messages,
+                stream=True,
+                **params,
             )
         except Exception as exc:
             self._raise_backend(exc)
@@ -145,7 +154,13 @@ class DeepSeekClient:
         finally:
             await stream.close()
 
-    async def stream(self, messages: list, body: dict, rewrite_model: str):
+    async def stream(
+        self,
+        messages: list,
+        body: dict,
+        rewrite_model: str,
+        upstream_model: str | None = None,
+    ):
         """Streaming: SSE passthrough with the model field rewritten per chunk.
 
         Fetches the first chunk eagerly so upstream errors surface before the
@@ -154,7 +169,10 @@ class DeepSeekClient:
         params = self._passthrough_params(body, stream=True)
         try:
             stream = await self._client.chat.completions.create(
-                model=self.model, messages=messages, stream=True, **params
+                model=upstream_model or self.model,
+                messages=messages,
+                stream=True,
+                **params,
             )
         except Exception as exc:
             self._raise_backend(exc)

@@ -244,9 +244,9 @@ async def _llm_error_handler(request: Request, exc: LLMBackendError):
 @app.get("/v1/models")
 async def list_models(request: Request):
     _check_auth(request)
-    # 对外模型列表：只暴露 PUBLIC_MODEL_NAME（deepseek-v4-flash-vl）。
+    # 对外模型列表：暴露 flash-vl 与 pro-vl（deepseek-v4-pro 已正式发布）。
     # 旧客户端如需使用，改自己的 model 配置即可（节点对任意 model 名都接受）。
-    ids = [config.PUBLIC_MODEL_NAME]
+    ids = [config.PUBLIC_MODEL_NAME, config.PUBLIC_PRO_MODEL_NAME]
     return JSONResponse(
         content={
             "object": "list",

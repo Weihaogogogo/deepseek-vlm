@@ -376,10 +376,45 @@ class TestForwardVisionPrefix:
         }
 
     def _patch_complete(self, monkeypatch, data):
-        async def fake_complete(messages, body):
+        async def fake_complete(messages, body, upstream_model=None):
             return data
 
         monkeypatch.setattr(router._llm, "complete", fake_complete)
+
+    def test_upstream_model_resolved_from_request_model(self, monkeypatch):
+        # 网关透传：对外模型名 -> 上游模型名，pro 请求打到 deepseek-v4-pro，
+        # 未知模型回退 flash；响应回显保持请求的 model 名不变。
+        captured = []
+
+        async def fake_complete(messages, body, upstream_model=None):
+            captured.append(upstream_model)
+            return self._reply()
+
+        monkeypatch.setattr(router._llm, "complete", fake_complete)
+
+        resp = asyncio.run(
+            router._forward(
+                self.MSGS, {"model": "deepseek-v4-pro-vl"}, self.MODEL, False
+            )
+        )
+        assert captured == ["deepseek-v4-pro"]
+        assert json.loads(resp.body)["model"] == self.MODEL  # 回显不变
+
+        resp = asyncio.run(
+            router._forward(
+                self.MSGS, {"model": "deepseek-v4-flash-vl"}, self.MODEL, False
+            )
+        )
+        assert captured == ["deepseek-v4-pro", "deepseek-v4-flash"]
+
+        resp = asyncio.run(
+            router._forward(self.MSGS, {"model": "unknown-model"}, self.MODEL, False)
+        )
+        assert captured == [
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash",
+        ]  # 未知名回退 flash 上游
 
     def test_non_streaming_reasoning_content_prefixed_content_unchanged(self, monkeypatch):
         # 有图轮：message.reasoning_content 以 vision_prefix 开头（无旧值时
@@ -414,7 +449,7 @@ class TestForwardVisionPrefix:
     def test_streaming_first_chunk_is_vision_prefix(self, monkeypatch):
         # 有图轮流式：首个 SSE chunk 的 delta 只有 reasoning_content ==
         # vision_prefix（无 content），其后才透传 deepseek 的流
-        async def fake_stream(messages, body, model):
+        async def fake_stream(messages, body, model, upstream_model=None):
             async def gen():
                 yield (
                     "data: "
@@ -492,7 +527,7 @@ class TestVlmPairThreeWay:
         async def fake_prepare(url):
             return "data:image/png;base64,AAAA"
 
-        async def fake_complete(messages, body):
+        async def fake_complete(messages, body, upstream_model=None):
             return self._reply()
 
         monkeypatch.setattr(router._vlm, "describe_overall", fake_overall)
@@ -547,7 +582,7 @@ class TestVlmPairThreeWay:
         async def fake_prepare(url):
             return "data:image/png;base64,AAAA"
 
-        async def fake_complete(messages, body):
+        async def fake_complete(messages, body, upstream_model=None):
             return self._reply()
 
         monkeypatch.setattr(router._vlm, "describe_overall", fake_overall)
@@ -591,7 +626,7 @@ class TestVlmPairThreeWay:
         async def fake_prepare(url):
             return "data:image/png;base64,AAAA"
 
-        async def fake_complete(messages, body):
+        async def fake_complete(messages, body, upstream_model=None):
             return self._reply()
 
         monkeypatch.setattr(router._vlm, "describe_overall", fake_overall)
@@ -719,7 +754,7 @@ class TestAssemblyLayout:
         async def fake_prepare(url):
             return "data:image/png;base64,AAAA"
 
-        async def fake_complete(messages, body):
+        async def fake_complete(messages, body, upstream_model=None):
             captured.append(messages)
             return self._reply()
 
