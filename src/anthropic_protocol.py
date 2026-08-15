@@ -5,6 +5,7 @@ Response side: OpenAI responses -> Anthropic message / SSE event stream.
 """
 import json
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +226,12 @@ def to_anthropic_message(openai_resp: dict, model: str, vision_prefix: str | Non
     message = choice.get("message") or {}
     content: list[dict] = []
     if vision_prefix:
-        content.insert(0, {"type": "thinking", "thinking": vision_prefix})
+        content.insert(0, {"type": "thinking", "thinking": vision_prefix, "signature": str(uuid.uuid4())})
+    # deepseek thinking 模式的 reasoning_content -> Anthropic thinking 块，
+    # 保证客户端下一轮回传完整思考，命中前缀缓存（同流式路径逻辑）。
+    reasoning = message.get("reasoning_content")
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning, "signature": str(uuid.uuid4())})
     text = message.get("content")
     if text:
         content.append({"type": "text", "text": text})
@@ -255,6 +261,8 @@ def to_anthropic_message(openai_resp: dict, model: str, vision_prefix: str | Non
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
+            # 缓存命中数（deepseek prompt_cache_hit_tokens -> Anthropic cache_read_input_tokens）
+            "cache_read_input_tokens": usage.get("prompt_cache_hit_tokens", 0),
         },
     }
 
@@ -282,9 +290,10 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
 
     sent_start = False
     text_index = None
+    reasoning_index = None  # deepseek reasoning_content -> Anthropic thinking block
     tool_indices: dict[int, int] = {}  # deepseek tc.index -> anthropic block index
     block_counter = 1 if vision_prefix else 0
-    usage = {"input_tokens": 0, "output_tokens": 0}
+    usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
     stop_reason = None
     blocks_done = False
 
@@ -298,6 +307,9 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
             usage = {
                 "input_tokens": getattr(chunk.usage, "prompt_tokens", 0),
                 "output_tokens": getattr(chunk.usage, "completion_tokens", 0),
+                "cache_read_input_tokens": getattr(
+                    chunk.usage, "prompt_cache_hit_tokens", 0
+                ),
             }
         if not chunk.choices:
             continue
@@ -317,7 +329,7 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
                         "content": [],
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                        "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0},
                     },
                 },
             )
@@ -327,7 +339,11 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
                     {
                         "type": "content_block_start",
                         "index": 0,
-                        "content_block": {"type": "thinking", "thinking": ""},
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": str(uuid.uuid4()),
+                        },
                     },
                 )
                 for i in range(0, len(vision_prefix), 2000):
@@ -349,6 +365,34 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
             sent_start = True
 
         if delta:
+            # deepseek thinking 模式下，reasoning_content 先于 content/tool_calls 流出。
+            # 转成 Anthropic thinking 块回传，客户端下一轮才能完整带回，
+            # 命中 deepseek 前缀缓存（否则回传空 reasoning -> 缓存全 miss）。
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                if reasoning_index is None:
+                    reasoning_index = block_counter
+                    block_counter += 1
+                    yield evt(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": reasoning_index,
+                            "content_block": {
+                                "type": "thinking",
+                                "thinking": "",
+                                "signature": str(uuid.uuid4()),
+                            },
+                        },
+                    )
+                yield evt(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": reasoning_index,
+                        "delta": {"type": "thinking_delta", "thinking": reasoning},
+                    },
+                )
             if delta.content:
                 if text_index is None:
                     text_index = block_counter
@@ -403,6 +447,11 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
             stop_reason = _stop_reason(choice.finish_reason)
             # Anthropic requires a content_block_stop after each block's deltas.
             if not blocks_done:
+                if reasoning_index is not None:
+                    yield evt(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": reasoning_index},
+                    )
                 if text_index is not None:
                     yield evt(
                         "content_block_stop",
@@ -429,12 +478,17 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
                     "content": [],
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0},
                 },
             },
         )
     elif not blocks_done:
         # Stream ended without an explicit finish_reason: close open blocks.
+        if reasoning_index is not None:
+            yield evt(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": reasoning_index},
+            )
         if text_index is not None:
             yield evt(
                 "content_block_stop",
