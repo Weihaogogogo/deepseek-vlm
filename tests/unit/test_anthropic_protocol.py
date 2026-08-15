@@ -40,8 +40,10 @@ def _tc(index, tid, name, arguments=None):
     )
 
 
-def _usage(prompt=12, completion=7):
-    return SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion)
+def _usage(prompt=12, completion=7, cache_hit=0):
+    return SimpleNamespace(
+        prompt_tokens=prompt, completion_tokens=completion, prompt_cache_hit_tokens=cache_hit
+    )
 
 
 async def _iter_chunks(chunks):
@@ -307,7 +309,7 @@ class TestToAnthropicMessage:
         assert out["role"] == "assistant"
         assert out["model"] == "deepseek-v4-flash-vl"
         assert out["content"] == [{"type": "text", "text": "你好"}]
-        assert out["usage"] == {"input_tokens": 10, "output_tokens": 5}
+        assert out["usage"] == {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0}
         assert out["stop_sequence"] is None
 
     def test_tool_calls_mapped_to_tool_use(self):
@@ -404,7 +406,7 @@ class TestAnthropicSse:
         assert events[4][1]["index"] == 0
         # stop → end_turn；usage 从尾 chunk 搬运到 message_delta
         assert events[5][1]["delta"]["stop_reason"] == "end_turn"
-        assert events[5][1]["usage"] == {"input_tokens": 12, "output_tokens": 7}
+        assert events[5][1]["usage"] == {"input_tokens": 12, "output_tokens": 7, "cache_read_input_tokens": 0}
 
     def test_tool_stream(self):
         events = _collect([
@@ -473,6 +475,47 @@ class TestAnthropicSse:
         assert events[0][1]["message"]["id"] == "msg_empty"
         assert events[1][1]["delta"]["stop_reason"] == "end_turn"
 
+    def test_cache_hit_tokens_passthrough_to_message_delta(self):
+        # 缓存命中数透传（deepseek prompt_cache_hit_tokens -> Anthropic cache_read_input_tokens），
+        # 供 Claude Code 侧监控缓存命中率。
+        events = _collect([
+            _chunk("chunk_1", content="hi"),
+            _chunk("chunk_2", finish_reason="stop", usage=_usage(100, 50, cache_hit=384)),
+        ])
+        assert events[-2][1]["usage"] == {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 384,
+        }
+
+    def test_reasoning_content_stream_emits_thinking_block(self):
+        # 修复回归：deepseek thinking 模式的 reasoning_content 必须转成 Anthropic thinking 块，
+        # 否则下一轮回传空 reasoning，缓存前缀对不上（命中率暴跌）。
+        def _reasoning_chunk(cid, reasoning=None, content=None, finish_reason=None):
+            delta = SimpleNamespace(content=content, tool_calls=None, reasoning_content=reasoning)
+            return SimpleNamespace(id=cid, choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)], usage=None)
+
+        events = _collect([
+            _reasoning_chunk("c1", reasoning="思考一"),
+            _reasoning_chunk("c2", reasoning="思考二"),
+            _reasoning_chunk("c3", content="答案", finish_reason="stop", ),
+            _chunk("c4", finish_reason="stop", usage=_usage()),
+        ])
+        # thinking 块应排在 text 块之前
+        starts = [e[1] for e in events if e[0] == "content_block_start"]
+        assert [s["content_block"]["type"] for s in starts] == ["thinking", "text"]
+        assert [s["index"] for s in starts] == [0, 1]
+        # thinking 内容按顺序拼接
+        thinking_deltas = [
+            e[1]["delta"]["thinking"]
+            for e in events if e[0] == "content_block_delta"
+            and e[1]["delta"].get("type") == "thinking_delta"
+        ]
+        assert "".join(thinking_deltas) == "思考一思考二"
+        # thinking 块有独立的 content_block_stop
+        stops = [e[1]["index"] for e in events if e[0] == "content_block_stop"]
+        assert stops == [0, 1]
+
     def test_three_tool_calls_get_three_blocks_with_unique_indices(self):
         events = _collect([
             _chunk("chunk_1", tool_calls=[
@@ -503,7 +546,7 @@ class TestAnthropicSse:
             usage_chunk,
             _chunk("chunk_3", finish_reason="stop"),
         ])
-        assert events[-2][1]["usage"] == {"input_tokens": 100, "output_tokens": 50}
+        assert events[-2][1]["usage"] == {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 0}
 
     def test_vision_prefix_stream_emits_thinking_block_first(self):
         events = _collect([
