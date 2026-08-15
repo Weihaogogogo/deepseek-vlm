@@ -5,6 +5,7 @@ Response side: OpenAI responses -> Anthropic message / SSE event stream.
 """
 import json
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -225,12 +226,12 @@ def to_anthropic_message(openai_resp: dict, model: str, vision_prefix: str | Non
     message = choice.get("message") or {}
     content: list[dict] = []
     if vision_prefix:
-        content.insert(0, {"type": "thinking", "thinking": vision_prefix})
+        content.insert(0, {"type": "thinking", "thinking": vision_prefix, "signature": str(uuid.uuid4())})
     # deepseek thinking 模式的 reasoning_content -> Anthropic thinking 块，
     # 保证客户端下一轮回传完整思考，命中前缀缓存（同流式路径逻辑）。
     reasoning = message.get("reasoning_content")
     if reasoning:
-        content.append({"type": "thinking", "thinking": reasoning})
+        content.append({"type": "thinking", "thinking": reasoning, "signature": str(uuid.uuid4())})
     text = message.get("content")
     if text:
         content.append({"type": "text", "text": text})
@@ -338,7 +339,11 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
                     {
                         "type": "content_block_start",
                         "index": 0,
-                        "content_block": {"type": "thinking", "thinking": ""},
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": str(uuid.uuid4()),
+                        },
                     },
                 )
                 for i in range(0, len(vision_prefix), 2000):
@@ -373,7 +378,11 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
                         {
                             "type": "content_block_start",
                             "index": reasoning_index,
-                            "content_block": {"type": "thinking", "thinking": ""},
+                            "content_block": {
+                                "type": "thinking",
+                                "thinking": "",
+                                "signature": str(uuid.uuid4()),
+                            },
                         },
                     )
                 yield evt(

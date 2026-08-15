@@ -349,7 +349,9 @@ class TestToAnthropicMessage:
         out = to_anthropic_message(
             self._resp(content="你好"), "m", vision_prefix="VLM 描述"
         )
-        assert out["content"][0] == {"type": "thinking", "thinking": "VLM 描述"}
+        assert out["content"][0]["type"] == "thinking"
+        assert out["content"][0]["thinking"] == "VLM 描述"
+        assert "signature" in out["content"][0]  # 带 signature，Claude Code 才会回传
         assert out["content"][1] == {"type": "text", "text": "你好"}
 
     def test_vision_prefix_with_tool_calls_keeps_thinking_first(self):
@@ -365,7 +367,9 @@ class TestToAnthropicMessage:
             "m",
             vision_prefix="VLM 描述",
         )
-        assert out["content"][0] == {"type": "thinking", "thinking": "VLM 描述"}
+        assert out["content"][0]["type"] == "thinking"
+        assert out["content"][0]["thinking"] == "VLM 描述"
+        assert "signature" in out["content"][0]
         assert out["content"][1]["type"] == "text"
         assert out["content"][2]["type"] == "tool_use"
 
@@ -567,7 +571,8 @@ class TestAnthropicSse:
         ]
         # thinking 块 index 0
         assert events[1][1]["index"] == 0
-        assert events[1][1]["content_block"] == {"type": "thinking", "thinking": ""}
+        assert events[1][1]["content_block"]["type"] == "thinking"
+        assert "signature" in events[1][1]["content_block"]  # 带 signature 才会被 Claude Code 回传
         assert events[2][1]["delta"] == {"type": "thinking_delta", "thinking": "VLM 描述"}
         assert events[3][1]["index"] == 0
         # 后续 text 块 index 从 1 开始
