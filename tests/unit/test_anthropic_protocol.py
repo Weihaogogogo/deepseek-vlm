@@ -557,10 +557,12 @@ class TestAnthropicSse:
             _chunk("chunk_1", content="你好"),
             _chunk("chunk_2", content="，世界", finish_reason="stop", usage=_usage()),
         ], vision_prefix="VLM 描述")
+        # 事件序列：thinking 块 = start → thinking_delta → signature_delta → stop
         assert [e[0] for e in events] == [
             "message_start",
             "content_block_start",
-            "content_block_delta",
+            "content_block_delta",  # thinking_delta
+            "content_block_delta",  # signature_delta
             "content_block_stop",
             "content_block_start",
             "content_block_delta",
@@ -569,19 +571,21 @@ class TestAnthropicSse:
             "message_delta",
             "message_stop",
         ]
-        # thinking 块 index 0
+        # thinking 块 index 0，signature 走 signature_delta 事件
         assert events[1][1]["index"] == 0
         assert events[1][1]["content_block"]["type"] == "thinking"
-        assert "signature" in events[1][1]["content_block"]  # 带 signature 才会被 Claude Code 回传
+        assert events[1][1]["content_block"]["signature"] == ""  # start 时 signature 留空
         assert events[2][1]["delta"] == {"type": "thinking_delta", "thinking": "VLM 描述"}
-        assert events[3][1]["index"] == 0
+        assert events[3][1]["delta"]["type"] == "signature_delta"  # 关键：signature_delta 事件
+        assert events[3][1]["delta"]["signature"]
+        assert events[4][1]["index"] == 0
         # 后续 text 块 index 从 1 开始
-        assert events[4][1]["index"] == 1
-        assert events[4][1]["content_block"]["type"] == "text"
-        assert events[5][1]["delta"]["text"] == "你好"
-        assert events[6][1]["delta"]["text"] == "，世界"
-        assert events[7][1]["index"] == 1
-        assert events[8][1]["delta"]["stop_reason"] == "end_turn"
+        assert events[5][1]["index"] == 1
+        assert events[5][1]["content_block"]["type"] == "text"
+        assert events[6][1]["delta"]["text"] == "你好"
+        assert events[7][1]["delta"]["text"] == "，世界"
+        assert events[8][1]["index"] == 1
+        assert events[9][1]["delta"]["stop_reason"] == "end_turn"
 
     def test_vision_prefix_stream_with_tool_use_indices(self):
         events = _collect([

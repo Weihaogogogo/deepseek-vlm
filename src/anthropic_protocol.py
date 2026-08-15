@@ -13,18 +13,54 @@ logger = logging.getLogger(__name__)
 # ---------- Request parsing: Anthropic -> OpenAI format ----------
 
 def parse_system(system) -> str:
-    """Anthropic top-level system field -> plain text (or '')."""
+    """Anthropic top-level system field -> plain text (or '').
+
+    Strips the ``x-anthropic-billing-header:`` line that Claude Code injects
+    into the top-level system field. That line carries a per-request
+    ``cc_version=...`` (varies every turn), and if it leaks into deepseek's
+    prompt it poisons the prefix cache from the very first token.
+    """
     if system is None:
         return ""
     if isinstance(system, str):
-        return system
-    if isinstance(system, list):
+        text = system
+    elif isinstance(system, list):
         parts = []
         for block in system:
             if isinstance(block, dict) and block.get("type") == "text":
                 parts.append(block.get("text", ""))
-        return "\n".join(parts)
-    return ""
+        text = "\n".join(parts)
+    else:
+        return ""
+    return _strip_billing_header(text)
+
+
+def _strip_billing_header(text: str) -> str:
+    """Remove the leading x-anthropic-billing-header line (Claude Code metadata)."""
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        if line.startswith("x-anthropic-billing-header:"):
+            continue
+        out.append(line)
+    # 去掉开头可能残留的空行（billing header 后面跟的换行）
+    while out and out[0].strip() == "":
+        out.pop(0)
+    return "\n".join(out)
+
+
+def _is_dynamic_system_message(text: str) -> bool:
+    """True if this system message is Claude Code's per-turn runtime metadata
+    (token budget / reminders) whose content changes every request and would
+    break deepseek's prefix cache."""
+    if not text:
+        return False
+    stripped = text.strip()
+    if stripped.startswith("<total_tokens>") or "tokens left</total_tokens>" in stripped:
+        return True
+    if stripped.startswith("<system-reminder>"):
+        return True
+    return False
 
 
 def _content_to_openai(content) -> list[dict]:
@@ -147,7 +183,13 @@ def parse_messages(anthropic_msgs: list) -> list[dict]:
             else:
                 out.append({"role": "assistant", "content": content})
         elif role == "system":
-            out.append({"role": "system", "content": content if isinstance(content, str) else parse_system(content)})
+            # 过滤 Claude Code 注入的动态 system 消息（每轮内容都变，会污染前缀缓存）：
+            # - <total_tokens>... tokens left</total_tokens> 令牌预算提示
+            # - <system-reminder> / 其他运行时提醒
+            s = content if isinstance(content, str) else parse_system(content)
+            if _is_dynamic_system_message(s):
+                continue
+            out.append({"role": "system", "content": s})
         else:
             raise ValueError(f"unsupported anthropic role: {role}")
     return out
@@ -339,11 +381,7 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
                     {
                         "type": "content_block_start",
                         "index": 0,
-                        "content_block": {
-                            "type": "thinking",
-                            "thinking": "",
-                            "signature": str(uuid.uuid4()),
-                        },
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
                     },
                 )
                 for i in range(0, len(vision_prefix), 2000):
@@ -358,6 +396,17 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
                             },
                         },
                     )
+                # signature 通过 signature_delta 事件发出（在 stop 之前），
+                # 而非 content_block_start 里的 content_block.signature——
+                # Claude Code 只认 signature_delta 这个位置。
+                yield evt(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "signature_delta", "signature": str(uuid.uuid4())},
+                    },
+                )
                 yield evt(
                     "content_block_stop",
                     {"type": "content_block_stop", "index": 0},
@@ -378,11 +427,7 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
                         {
                             "type": "content_block_start",
                             "index": reasoning_index,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": "",
-                                "signature": str(uuid.uuid4()),
-                            },
+                            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
                         },
                     )
                 yield evt(
@@ -448,6 +493,15 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
             # Anthropic requires a content_block_stop after each block's deltas.
             if not blocks_done:
                 if reasoning_index is not None:
+                    # thinking 块的 signature 在 stop 之前通过 signature_delta 发出
+                    yield evt(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": reasoning_index,
+                            "delta": {"type": "signature_delta", "signature": str(uuid.uuid4())},
+                        },
+                    )
                     yield evt(
                         "content_block_stop",
                         {"type": "content_block_stop", "index": reasoning_index},
@@ -485,6 +539,14 @@ async def anthropic_sse(chunk_iter, model: str, vision_prefix: str | None = None
     elif not blocks_done:
         # Stream ended without an explicit finish_reason: close open blocks.
         if reasoning_index is not None:
+            yield evt(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": reasoning_index,
+                    "delta": {"type": "signature_delta", "signature": str(uuid.uuid4())},
+                },
+            )
             yield evt(
                 "content_block_stop",
                 {"type": "content_block_stop", "index": reasoning_index},
